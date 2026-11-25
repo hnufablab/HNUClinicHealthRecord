@@ -1,0 +1,808 @@
+"use client";
+
+import { useCallback, useEffect, useState } from "react";
+import { toast } from "sonner";
+import {
+    Loader2,
+    ShieldCheck,
+    ShieldAlert,
+    BarChart3,
+    Stethoscope,
+    Phone,
+    UserRound,
+    KeyRound,
+} from "lucide-react";
+
+import DoctorLayout from "@/components/doctor/doctor-layout";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card } from "@/components/ui/card";
+import { AccountCard } from "@/components/account/account-card";
+import { AccountRefreshButton } from "@/components/account/account-refresh-button";
+import { AccountSection } from "@/components/account/account-section";
+import { AccountSummaryGrid } from "@/components/account/account-summary";
+import type { AccountSummaryItem } from "@/components/account/account-summary";
+import type { AccountPasswordResult } from "@/components/account/account-password-dialog";
+import {
+    formatPhoneInputDisplay,
+    isAllowedNameSuffix,
+    NAME_SUFFIX_OPTIONS,
+    validateAndNormalizeContacts,
+} from "@/lib/validation";
+import { handleRateLimitError } from "@/lib/rate-limit-toast";
+
+import DoctorAccountLoading from "./loading";
+
+import {
+    AlertDialog,
+    AlertDialogAction,
+    AlertDialogCancel,
+    AlertDialogContent,
+    AlertDialogDescription,
+    AlertDialogFooter,
+    AlertDialogHeader,
+    AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select";
+
+type Profile = {
+    user_id: string;
+    username: string;
+    role: string;
+    status: "Active" | "Inactive";
+    fname: string;
+    mname?: string | null;
+    lname: string;
+    suffix?: string | null;
+    date_of_birth?: string;
+    gender?: string | null;
+    email?: string;
+    contactno?: string | null;
+    address?: string | null;
+    allergies?: string | null;
+};
+
+const PHONE_PREFIX = "09";
+
+function extractSubscriberDigits(value?: string | null) {
+    const formatted = formatPhoneInputDisplay(value);
+    if (!formatted) return "";
+
+    if (formatted.startsWith(PHONE_PREFIX)) {
+        return formatted.slice(PHONE_PREFIX.length, PHONE_PREFIX.length + 9);
+    }
+
+    return formatted.replace(/\D/g, "").slice(0, 9);
+}
+
+function buildPhoneNumberFromSubscriber(subscriber: string) {
+    const digits = subscriber.replace(/\D/g, "").slice(0, 9);
+    return digits ? `${PHONE_PREFIX}${digits}` : "";
+}
+
+export default function DoctorAccountPage() {
+    const namePattern = /^[A-Za-z][A-Za-z\s'\-.]*$/;
+    const suffixOptions = NAME_SUFFIX_OPTIONS.filter(Boolean);
+    const NO_SUFFIX_VALUE = "__none__";
+    const [profile, setProfile] = useState<Profile | null>(null);
+    const [profileLoading, setProfileLoading] = useState(false);
+    const [initializing, setInitializing] = useState(true);
+
+    const [tempDOB, setTempDOB] = useState("");
+    const [showDOBConfirm, setShowDOBConfirm] = useState(false);
+    const [tempGender, setTempGender] = useState<"Male" | "Female" | "">("");
+    const [showGenderConfirm, setShowGenderConfirm] = useState(false);
+    const [refreshing, setRefreshing] = useState(false);
+
+
+    // Load Profile
+    const loadProfile = useCallback(async () => {
+        try {
+            const res = await fetch("/api/doctor/account/me", {
+                cache: "no-store",
+                next: { revalidate: 0 }, // ensures it always re-fetches
+            });
+
+            const data = await res.json();
+
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many profile requests. Please wait before trying again.")) {
+                    return;
+                }
+                toast.error(data?.error ?? "Failed to load profile");
+                return;
+            }
+
+            if (data.error) {
+                toast.error(data.error);
+                return;
+            }
+
+            const normalizedSuffix =
+                typeof data.profile?.suffix === "string" && data.profile.suffix.trim()
+                    ? data.profile.suffix.trim()
+                    : null;
+
+            setProfile({
+                user_id: data.accountId,
+                username: data.username,
+                role: data.role,
+                status: data.status,
+                fname: data.profile?.fname || "",
+                mname: data.profile?.mname || "",
+                lname: data.profile?.lname || "",
+                suffix: normalizedSuffix,
+                date_of_birth: data.profile?.date_of_birth || "",
+                gender: data.profile?.gender || "",
+                contactno: data.profile?.contactno || "",
+                email: data.profile?.email || "",
+                address: data.profile?.address || "",
+                allergies: data.profile?.allergies || "",
+            });
+        } catch (err) {
+            console.error("Failed to load profile:", err);
+            toast.error("Failed to load profile");
+        } finally {
+            setInitializing(false);
+        }
+    }, []);
+
+    useEffect(() => {
+        loadProfile();
+    }, [loadProfile]);
+
+    // Update Profile
+    async function handleProfileUpdate(e: React.FormEvent<HTMLFormElement>) {
+        e.preventDefault();
+        if (!profile) return;
+
+        if (!profile.fname.trim() || !profile.lname.trim()) {
+            toast.error("First and Last Name are required.");
+            return;
+        }
+
+        const isInvalidName = (value: string) => {
+            const trimmed = value.trim();
+            return trimmed.length < 2 || !namePattern.test(trimmed);
+        };
+
+        if (isInvalidName(profile.fname)) {
+            toast.error(
+                "First name must be at least 2 characters and can only include letters, spaces, apostrophes, periods, or hyphens."
+            );
+            return;
+        }
+
+        if (profile.mname && isInvalidName(profile.mname)) {
+            toast.error(
+                "Middle name must be at least 2 characters and can only include letters, spaces, apostrophes, periods, or hyphens."
+            );
+            return;
+        }
+
+        if (isInvalidName(profile.lname)) {
+            toast.error(
+                "Last name must be at least 2 characters and can only include letters, spaces, apostrophes, periods, or hyphens."
+            );
+            return;
+        }
+
+        if (!isAllowedNameSuffix(profile.suffix)) {
+            toast.error("Please select a valid suffix option or leave it blank.");
+            return;
+        }
+
+        const contactValidation = validateAndNormalizeContacts({
+            email: profile.email,
+            contactNumber: profile.contactno,
+        });
+
+        if (!contactValidation.success) {
+            toast.error(contactValidation.error);
+            return;
+        }
+
+        const updatedProfile = {
+            ...profile,
+            email: contactValidation.email,
+            contactno: contactValidation.contactNumber,
+        };
+
+        setProfile(updatedProfile);
+
+        try {
+            setProfileLoading(true);
+            const payload = {
+                ...updatedProfile,
+            };
+
+            const res = await fetch("/api/doctor/account/me", {
+                method: "PUT",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ profile: payload }),
+            });
+
+            const data = await res.json();
+
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many profile updates. Please wait before trying again.")) {
+                    return;
+                }
+                toast.error(data.error ?? "Failed to update profile");
+                return;
+            }
+
+            if (data.error) {
+                toast.error(data.error);
+            } else {
+                toast.success("Profile updated successfully!");
+                if (data.verificationEmailSent) {
+                    const targetEmail = data.profile?.email?.trim();
+                    toast.success(
+                        targetEmail
+                            ? `A verification email was sent to ${targetEmail}. Please confirm it to receive clinic notifications.`
+                            : "A verification email was sent. Please check your inbox to confirm the address."
+                    );
+                }
+
+                setProfile((prev) => ({
+                    ...prev!,
+                    ...updatedProfile,
+                }));
+
+            }
+        } catch (err) {
+            console.error("Profile update failed:", err);
+            toast.error("Failed to update profile");
+        } finally {
+            setProfileLoading(false);
+        }
+    }
+
+    const handlePasswordSubmit = useCallback(
+        async ({ oldPassword, newPassword }: { oldPassword: string; newPassword: string }): Promise<AccountPasswordResult> => {
+            try {
+                const res = await fetch("/api/doctor/account/password", {
+                    method: "PUT",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ oldPassword, newPassword }),
+                });
+
+                const data = await res.json();
+                if (data.error) {
+                    return { error: data.error };
+                }
+
+                const message = "Password updated successfully!";
+                toast.success(message);
+                return { success: message };
+            } catch (error) {
+                console.error("Failed to update password", error);
+                return { error: "Failed to update password. Please try again." };
+            }
+        },
+        []
+    );
+
+    const completionFields = profile
+        ? [
+            profile.email,
+            profile.contactno,
+            profile.address,
+        ]
+        : [];
+
+    const completionCount = completionFields.filter((value) => {
+        if (typeof value === "string") {
+            return value.trim().length > 0;
+        }
+        return Boolean(value);
+    }).length;
+
+    const completionPercent = completionFields.length
+        ? Math.round((completionCount / completionFields.length) * 100)
+        : 0;
+
+
+    const summaryItems: AccountSummaryItem[] = profile
+        ? [
+            {
+                icon: profile.status === "Active" ? ShieldCheck : ShieldAlert,
+                label: "Account status",
+                value: profile.status,
+                helper:
+                    profile.status === "Active"
+                        ? "Ready to access clinic systems."
+                        : "Contact the administrator to reactivate your access.",
+                accent: profile.status === "Active" ? "emerald" : "rose",
+            },
+            {
+                icon: BarChart3,
+                label: "Profile completeness",
+                value: `${completionPercent}% complete`,
+                helper:
+                    completionPercent >= 100
+                        ? "All key contact details are filled."
+                        : "Add missing contact information.",
+                progress: completionPercent,
+                accent:
+                    completionPercent >= 80
+                        ? "emerald"
+                        : completionPercent >= 50
+                            ? "amber"
+                            : "rose",
+            },
+        ]
+        : [];
+
+    const handleManualRefresh = useCallback(async () => {
+        try {
+            setRefreshing(true);
+            await loadProfile();
+        } finally {
+            setRefreshing(false);
+        }
+    }, [loadProfile]);
+
+    if (initializing) {
+        return <DoctorAccountLoading />;
+    }
+
+    return (
+        <DoctorLayout
+            title="Account Management"
+            description="Keep your clinic profile accurate, secure, and ready for seamless coordination."
+        >
+            <div className="mx-auto w-full max-w-5xl space-y-8">
+                {profileLoading ? (
+                    <Card className="rounded-[28px] border border-emerald-100/70 bg-white/95 px-6 py-6 text-center shadow-sm backdrop-blur">
+                        <div className="flex flex-col items-center gap-3 text-emerald-700">
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                            <p className="text-sm font-medium">Saving your latest updates…</p>
+                        </div>
+                    </Card>
+                ) : null}
+
+                {refreshing ? (
+                    <Card className="rounded-[28px] border border-emerald-100/70 bg-white/95 px-6 py-6 text-center shadow-sm backdrop-blur">
+                        <div className="flex flex-col items-center gap-3 text-emerald-700">
+                            <Loader2 className="h-5 w-5 animate-spin" />
+                            <p className="text-sm font-medium">Refreshing your profile data…</p>
+                        </div>
+                    </Card>
+                ) : null}
+
+                {profile ? (
+                    <div className="space-y-8">
+                        <AccountSummaryGrid items={summaryItems} />
+                        <AccountCard
+                            description="Update your personal details and credentials to keep clinic records current."
+                            onPasswordSubmit={handlePasswordSubmit}
+                        >
+                            <form onSubmit={handleProfileUpdate} className="space-y-10">
+                                <AccountSection
+                                    icon={KeyRound}
+                                    title="Account credentials"
+                                    description="Reference details used across clinic systems."
+                                >
+                                    <div className="grid gap-4 md:grid-cols-2">
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">User ID</Label>
+                                            <Input value={profile.user_id} disabled />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Employee ID</Label>
+                                            <Input value={profile.username} disabled />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Role</Label>
+                                            <Input value={profile.role} disabled />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Status</Label>
+                                            <Input value={profile.status} disabled />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Date of birth</Label>
+                                            {profile.date_of_birth ? (
+                                                <Input
+                                                    type="date"
+                                                    value={profile.date_of_birth?.slice(0, 10) || ""}
+                                                    disabled
+                                                />
+                                            ) : (
+                                                <>
+                                                    <Input
+                                                        type="date"
+                                                        value={tempDOB}
+                                                        onChange={(e) => setTempDOB(e.target.value)}
+                                                    />
+                                                    {tempDOB ? (
+                                                        <Button
+                                                            type="button"
+                                                            className="mt-2 w-max rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700"
+                                                            onClick={() => setShowDOBConfirm(true)}
+                                                        >
+                                                            Confirm date
+                                                        </Button>
+                                                    ) : null}
+                                                    <p className="text-xs text-muted-foreground">
+                                                        This can only be saved once. Double-check before confirming.
+                                                    </p>
+                                                    <AlertDialog open={showDOBConfirm} onOpenChange={setShowDOBConfirm}>
+                                                        <AlertDialogContent className="max-w-sm sm:max-w-md">
+                                                            <AlertDialogHeader>
+                                                                <AlertDialogTitle>Confirm Date of Birth</AlertDialogTitle>
+                                                                <AlertDialogDescription>
+                                                                    You are about to set your Date of Birth to{' '}
+                                                                    <span className="font-semibold text-emerald-700">{tempDOB}</span>.
+                                                                    <br />
+                                                                    This action can only be done once and cannot be changed later.
+                                                                </AlertDialogDescription>
+                                                            </AlertDialogHeader>
+
+                                                            <AlertDialogFooter className="mt-4">
+                                                                <AlertDialogCancel
+                                                                    onClick={() => {
+                                                                        setTempDOB("");
+                                                                        setShowDOBConfirm(false);
+                                                                    }}
+                                                                >
+                                                                    Cancel
+                                                                </AlertDialogCancel>
+                                                                <AlertDialogAction
+                                                                    className="bg-emerald-600 hover:bg-emerald-700"
+                                                                    onClick={async () => {
+                                                                        const contactValidation = validateAndNormalizeContacts({
+                                                                            email: profile.email,
+                                                                            contactNumber: profile.contactno,
+                                                                        });
+
+                                                                        if (!contactValidation.success) {
+                                                                            toast.error(contactValidation.error);
+                                                                            return;
+                                                                        }
+
+                                                                        const updatedProfile = {
+                                                                            ...profile,
+                                                                            email: contactValidation.email,
+                                                                            contactno: contactValidation.contactNumber,
+                                                                            date_of_birth: tempDOB,
+                                                                        };
+
+                                                                        setProfile(updatedProfile);
+                                                                        setShowDOBConfirm(false);
+
+                                                                        try {
+                                                                            setProfileLoading(true);
+                                                                            const payload = {
+                                                                                ...updatedProfile,
+                                                                            };
+
+                                                                            const res = await fetch("/api/doctor/account/me", {
+                                                                                method: "PUT",
+                                                                                headers: { "Content-Type": "application/json" },
+                                                                                body: JSON.stringify({ profile: payload }),
+                                                                            });
+
+                                                                            const data = await res.json();
+                                                                            if (!res.ok) {
+                                                                                if (
+                                                                                    handleRateLimitError(
+                                                                                        res,
+                                                                                        data,
+                                                                                        "Too many profile updates. Please wait before trying again."
+                                                                                    )
+                                                                                ) {
+                                                                                    return;
+                                                                                }
+                                                                                toast.error(data.error ?? "Failed to save Date of Birth");
+                                                                            } else if (data.error) {
+                                                                                toast.error(data.error);
+                                                                            } else {
+                                                                                toast.success("Date of Birth saved!");
+                                                                                if (data.verificationEmailSent) {
+                                                                                    const targetEmail =
+                                                                                        data.profile?.email?.trim();
+                                                                                    toast.success(
+                                                                                        targetEmail
+                                                                                            ? `A verification email was sent to ${targetEmail}. Please confirm it to receive clinic notifications.`
+                                                                                            : "A verification email was sent. Please check your inbox to confirm the address."
+                                                                                    );
+                                                                                }
+                                                                                await loadProfile();
+                                                                            }
+                                                                        } catch {
+                                                                            toast.error("Failed to save Date of Birth");
+                                                                        } finally {
+                                                                            setProfileLoading(false);
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    Confirm
+                                                                </AlertDialogAction>
+                                                            </AlertDialogFooter>
+                                                        </AlertDialogContent>
+                                                    </AlertDialog>
+                                                </>
+                                            )}
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Gender</Label>
+                                            {profile.gender ? (
+                                                <Input value={profile.gender || ""} disabled />
+                                            ) : (
+                                                <>
+                                                    <Select
+                                                        value={tempGender}
+                                                        onValueChange={(value) => setTempGender(value as "Male" | "Female")}
+                                                    >
+                                                        <SelectTrigger>
+                                                            <SelectValue placeholder="Select gender" />
+                                                        </SelectTrigger>
+                                                        <SelectContent>
+                                                            <SelectItem value="Male">Male</SelectItem>
+                                                            <SelectItem value="Female">Female</SelectItem>
+                                                        </SelectContent>
+                                                    </Select>
+                                                    {tempGender ? (
+                                                        <Button
+                                                            type="button"
+                                                            className="mt-2 w-max rounded-2xl bg-emerald-600 px-4 py-2 text-xs font-semibold text-white shadow-sm transition hover:bg-emerald-700"
+                                                            onClick={() => setShowGenderConfirm(true)}
+                                                        >
+                                                            Confirm gender
+                                                        </Button>
+                                                    ) : null}
+                                                    <p className="text-xs text-muted-foreground">
+                                                        This can only be saved once. Double-check before confirming.
+                                                    </p>
+                                                    <AlertDialog open={showGenderConfirm} onOpenChange={setShowGenderConfirm}>
+                                                        <AlertDialogContent className="max-w-sm sm:max-w-md">
+                                                            <AlertDialogHeader>
+                                                                <AlertDialogTitle>Confirm Gender</AlertDialogTitle>
+                                                                <AlertDialogDescription>
+                                                                    You are about to set your gender to{" "}
+                                                                    <span className="font-semibold text-emerald-700">{tempGender}</span>.
+                                                                    <br />
+                                                                    This action can only be done once and cannot be changed later.
+                                                                </AlertDialogDescription>
+                                                            </AlertDialogHeader>
+                                                            <AlertDialogFooter className="mt-4">
+                                                                <AlertDialogCancel
+                                                                    onClick={() => {
+                                                                        setTempGender("");
+                                                                        setShowGenderConfirm(false);
+                                                                    }}
+                                                                >
+                                                                    Cancel
+                                                                </AlertDialogCancel>
+                                                                <AlertDialogAction
+                                                                    className="bg-emerald-600 hover:bg-emerald-700"
+                                                                    onClick={async () => {
+                                                                        const contactValidation = validateAndNormalizeContacts({
+                                                                            email: profile.email,
+                                                                            contactNumber: profile.contactno,
+                                                                        });
+
+                                                                        if (!contactValidation.success) {
+                                                                            toast.error(contactValidation.error);
+                                                                            return;
+                                                                        }
+
+                                                                        const updatedProfile = {
+                                                                            ...profile,
+                                                                            email: contactValidation.email,
+                                                                            contactno: contactValidation.contactNumber,
+                                                                            gender: tempGender,
+                                                                        };
+
+                                                                        setProfile(updatedProfile);
+                                                                        setShowGenderConfirm(false);
+
+                                                                        try {
+                                                                            setProfileLoading(true);
+                                                                            const payload = {
+                                                                                ...updatedProfile,
+                                                                            };
+
+                                                                            const res = await fetch("/api/doctor/account/me", {
+                                                                                method: "PUT",
+                                                                                headers: { "Content-Type": "application/json" },
+                                                                                body: JSON.stringify({ profile: payload }),
+                                                                            });
+
+                                                                            const data = await res.json();
+                                                                            if (!res.ok) {
+                                                                                if (
+                                                                                    handleRateLimitError(
+                                                                                        res,
+                                                                                        data,
+                                                                                        "Too many profile updates. Please wait before trying again."
+                                                                                    )
+                                                                                ) {
+                                                                                    return;
+                                                                                }
+                                                                                toast.error(data.error ?? "Failed to save gender");
+                                                                            } else if (data.error) {
+                                                                                toast.error(data.error);
+                                                                            } else {
+                                                                                toast.success("Gender saved!");
+                                                                                if (data.verificationEmailSent) {
+                                                                                    const targetEmail = data.profile?.email?.trim();
+                                                                                    toast.success(
+                                                                                        targetEmail
+                                                                                            ? `A verification email was sent to ${targetEmail}. Please confirm it to receive clinic notifications.`
+                                                                                            : "A verification email was sent. Please check your inbox to confirm the address."
+                                                                                    );
+                                                                                }
+                                                                                await loadProfile();
+                                                                            }
+                                                                        } catch {
+                                                                            toast.error("Failed to save gender");
+                                                                        } finally {
+                                                                            setProfileLoading(false);
+                                                                        }
+                                                                    }}
+                                                                >
+                                                                    Confirm
+                                                                </AlertDialogAction>
+                                                            </AlertDialogFooter>
+                                                        </AlertDialogContent>
+                                                    </AlertDialog>
+                                                </>
+                                            )}
+                                        </div>
+                                    </div>
+                                </AccountSection>
+
+                                <AccountSection
+                                    icon={UserRound}
+                                    title="Personal information"
+                                    description="Keep your basic profile details current for accurate coordination."
+                                >
+                                    <div className="grid gap-4 md:grid-cols-4">
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">First name</Label>
+                                            <Input
+                                                value={profile.fname}
+                                                onChange={(e) => setProfile({ ...profile, fname: e.target.value })}
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Middle name</Label>
+                                            <Input
+                                                value={profile.mname || ""}
+                                                onChange={(e) => setProfile({ ...profile, mname: e.target.value })}
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Last name</Label>
+                                            <Input
+                                                value={profile.lname}
+                                                onChange={(e) => setProfile({ ...profile, lname: e.target.value })}
+                                            />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Suffix</Label>
+                                            <Select
+                                                value={profile.suffix ?? NO_SUFFIX_VALUE}
+                                                onValueChange={(value) =>
+                                                    setProfile({
+                                                        ...profile,
+                                                        suffix: value === NO_SUFFIX_VALUE ? null : value,
+                                                    })
+                                                }
+                                            >
+                                                <SelectTrigger>
+                                                    <SelectValue placeholder="No suffix" />
+                                                </SelectTrigger>
+                                                <SelectContent>
+                                                    <SelectItem value={NO_SUFFIX_VALUE}>No suffix</SelectItem>
+                                                    {suffixOptions.map((suffix) => (
+                                                        <SelectItem key={suffix} value={suffix}>
+                                                            {suffix}
+                                                        </SelectItem>
+                                                    ))}
+                                                </SelectContent>
+                                            </Select>
+                                        </div>
+                                    </div>
+                                </AccountSection>
+
+                                <AccountSection
+                                    icon={Phone}
+                                    title="Contact & address"
+                                    description="Ensure the clinic can reach you for urgent updates."
+                                >
+                                    <div className="grid gap-4 md:grid-cols-2">
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Email</Label>
+                                            <Input
+                                                type="email"
+                                                placeholder="example@hnu.edu.ph"
+                                                value={profile.email || ""}
+                                                onChange={(e) => setProfile({ ...profile, email: e.target.value })}
+                                            />
+                                            <p className="text-xs text-emerald-700">
+                                                Adding a new email will trigger a verification link before the clinic sends notifications there.
+                                            </p>
+                                        </div>
+                                        <div className="space-y-2">
+                                            <Label className="text-sm font-medium text-emerald-900">Contact number</Label>
+                                            <div className="flex">
+                                                <span className="flex items-center rounded-l-md border border-input bg-emerald-50 px-3 text-sm font-semibold text-emerald-800">
+                                                    {PHONE_PREFIX}
+                                                </span>
+                                                <Input
+                                                    type="text"
+                                                    inputMode="numeric"
+                                                    pattern="[0-9]*"
+                                                    className="rounded-l-none border-l-0"
+                                                    placeholder="XXXXXXXXX"
+                                                    value={extractSubscriberDigits(profile.contactno)}
+                                                    onChange={(event) =>
+                                                        setProfile({
+                                                            ...profile,
+                                                            contactno: buildPhoneNumberFromSubscriber(event.target.value),
+                                                        })
+                                                    }
+                                                />
+                                            </div>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Label className="text-sm font-medium text-emerald-900">Address</Label>
+                                        <Input
+                                            value={profile.address || ""}
+                                            onChange={(e) => setProfile({ ...profile, address: e.target.value })}
+                                        />
+                                    </div>
+                                </AccountSection>
+
+                                <div className="flex flex-col gap-3 sm:flex-row sm:justify-end">
+                                    <AccountRefreshButton
+                                        onClick={() => void handleManualRefresh()}
+                                        disabled={refreshing || profileLoading}
+                                        isRefreshing={refreshing}
+                                    />
+                                    <Button
+                                        type="submit"
+                                        className="flex items-center justify-center gap-2 rounded-2xl bg-primary px-6 py-2 text-sm font-semibold text-primary-foreground shadow-sm transition hover:bg-primary/90 disabled:opacity-60"
+                                        disabled={profileLoading}
+                                    >
+                                        {profileLoading ? (
+                                            <>
+                                                <Loader2 className="h-4 w-4 animate-spin" /> Saving…
+                                            </>
+                                        ) : (
+                                            "Save changes"
+                                        )}
+                                    </Button>
+                                </div>
+                            </form>
+                        </AccountCard>
+                    </div>
+                ) : (
+                    <Card className="rounded-[28px] border border-emerald-100/70 bg-white/95 px-6 py-6 text-center shadow-sm backdrop-blur">
+                        <div className="space-y-2">
+                            <Stethoscope className="mx-auto h-6 w-6 text-emerald-600" />
+                            <p className="text-sm text-muted-foreground">
+                                We couldn&apos;t retrieve your account information right now. Try refreshing or contact the clinic administrator.
+                            </p>
+                        </div>
+                    </Card>
+                )}
+            </div>
+        </DoctorLayout>
+    );
+
+}

@@ -1,0 +1,1519 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+    AlertCircle,
+    Ban,
+    CalendarDays,
+    ClipboardList,
+    Clock3,
+    Loader2,
+    MoreHorizontal,
+    Search,
+    Undo2,
+} from "lucide-react";
+
+import PatientLayout from "@/components/patient/patient-layout";
+import { Button } from "@/components/ui/button";
+import { Card, CardHeader, CardTitle, CardContent } from "@/components/ui/card";
+import { Calendar } from "@/components/ui/calendar";
+import { AppointmentPanel } from "@/components/appointments/appointment-panel";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogFooter,
+    DialogHeader,
+    DialogTitle,
+} from "@/components/ui/dialog";
+import {
+    AlertDialog,
+    AlertDialogAction,
+    AlertDialogCancel,
+    AlertDialogContent,
+    AlertDialogDescription,
+    AlertDialogFooter,
+    AlertDialogHeader,
+    AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import {
+    DropdownMenu,
+    DropdownMenuContent,
+    DropdownMenuItem,
+    DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
+import { toast } from "sonner";
+import { handleRateLimitError } from "@/lib/rate-limit-toast";
+import { formatManilaDateTime, formatManilaISODate, formatTimeRange, manilaNow } from "@/lib/time";
+import { getServiceOptionsForSpecialization, resolveServiceType } from "@/lib/service-options";
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
+import { cn } from "@/lib/utils";
+
+import PatientAppointmentsLoading from "./loading";
+
+type Clinic = { clinic_id: string; clinic_name: string };
+type Doctor = { user_id: string; name: string; specialization: "Physician" | "Dentist" | null };
+type Slot = { start: string; end: string };
+type Appointment = {
+    id: string;
+    clinic: string;
+    clinicId: string;
+    doctor: string;
+    doctorId: string;
+    date: string;
+    time: string;
+    startISO: string;
+    endISO: string;
+    serviceType: string | null;
+    status: string;
+};
+
+const MIN_BOOKING_LEAD_DAYS = 3;
+
+function toInputDate(date: Date): string {
+    const adjusted = new Date(date.getTime() - date.getTimezoneOffset() * 60 * 1000);
+    return adjusted.toISOString().split("T")[0];
+}
+
+const DAY_IN_MS = 24 * 60 * 60 * 1000;
+
+function computeMinBookingDate(): string {
+    const base = manilaNow();
+    const future = new Date(base.getTime() + MIN_BOOKING_LEAD_DAYS * DAY_IN_MS);
+    return toInputDate(future);
+}
+
+function isoToInputDate(iso: string | null | undefined): string {
+    if (!iso) return "";
+    const date = new Date(iso);
+    if (Number.isNaN(date.getTime())) return "";
+    return toInputDate(date);
+}
+
+const STATUS_ORDER = ["Pending", "Approved", "Moved", "Completed", "Cancelled"] as const;
+
+type AppointmentStatus = (typeof STATUS_ORDER)[number];
+
+const STATUS_LABELS: Record<AppointmentStatus, string> = {
+    Pending: "Awaiting review",
+    Approved: "Confirmed",
+    Moved: "Rescheduled",
+    Completed: "Completed",
+    Cancelled: "Cancelled",
+};
+
+const STATUS_BADGE_CLASSES: Record<AppointmentStatus, string> = {
+    Pending: "border-amber-200 bg-amber-50 text-amber-700",
+    Approved: "border-emerald-200 bg-primary/10 text-emerald-700",
+    Moved: "border-sky-200 bg-sky-50 text-sky-700",
+    Completed: "border-slate-200 bg-slate-100 text-slate-700",
+    Cancelled: "border-rose-200 bg-rose-50 text-rose-700",
+};
+
+const ACTIVE_STATUSES: AppointmentStatus[] = ["Pending", "Approved", "Moved"];
+
+const STATUS_VALUE_MAP: Record<string, AppointmentStatus> = {
+    pending: "Pending",
+    approved: "Approved",
+    moved: "Moved",
+    completed: "Completed",
+    cancelled: "Cancelled",
+};
+
+function normalizeStatus(value: string): AppointmentStatus | null {
+    return STATUS_VALUE_MAP[value.toLowerCase()] ?? null;
+}
+
+function formatDateOnly(value: string) {
+    if (!value) return "—";
+    const iso = `${value}T00:00:00+08:00`;
+    return (
+        formatManilaDateTime(iso, {
+            hour: undefined,
+            minute: undefined,
+        }) ?? "—"
+    );
+}
+
+function formatAppointmentDate(appointment: Appointment) {
+    if (appointment.startISO) {
+        return (
+            formatManilaDateTime(appointment.startISO, {
+                hour: undefined,
+                minute: undefined,
+            }) ?? formatDateOnly(appointment.date)
+        );
+    }
+    return formatDateOnly(appointment.date);
+}
+
+function formatAppointmentTime(appointment: Appointment) {
+    const range = formatTimeRange(appointment.startISO, appointment.endISO);
+    if (range) return range;
+    return appointment.time || "—";
+}
+
+function humanizeService(value: string | null | undefined) {
+    if (!value) return "—";
+    return value
+        .toLowerCase()
+        .split("_")
+        .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+        .join(" ");
+}
+
+export default function PatientAppointmentsPage() {
+    const [minBookingDate, setMinBookingDate] = useState(() => computeMinBookingDate());
+
+    const earliestBookedMessage = useMemo(() => {
+        const label = formatDateOnly(minBookingDate);
+        return label
+            ? `Appointments must be booked on ${label} at earliest.`
+            : `Appointments must be booked at least ${MIN_BOOKING_LEAD_DAYS} days in advance.`;
+    }, [minBookingDate]);
+
+    useEffect(() => {
+        const updateMinDate = () =>
+            setMinBookingDate((current) => {
+                const next = computeMinBookingDate();
+                return current === next ? current : next;
+            });
+
+        updateMinDate();
+        const interval = setInterval(updateMinDate, 60 * 60 * 1000);
+        return () => clearInterval(interval);
+    }, []);
+
+    // Form state
+    const [clinics, setClinics] = useState<Clinic[]>([]);
+    const [doctors, setDoctors] = useState<Doctor[]>([]);
+    const [doctorAvailability, setDoctorAvailability] = useState<
+        Record<string, { slots: Slot[]; loading: boolean; error: string | null; onLeave: boolean }>
+    >({});
+    const [loadingClinics, setLoadingClinics] = useState(true);
+    const [loadingDoctors, setLoadingDoctors] = useState(false);
+    const [submitting, setSubmitting] = useState(false);
+
+    const [clinicId, setClinicId] = useState("");
+    const [doctorId, setDoctorId] = useState("");
+    const [serviceType, setServiceType] = useState<string>("");
+    const [date, setDate] = useState<string>("");
+    const [timeStart, setTimeStart] = useState<string>("");
+    const [calendarMonth, setCalendarMonth] = useState<Date>(() => manilaNow());
+    const [availableDates, setAvailableDates] = useState<string[]>([]);
+    const [leaveDates, setLeaveDates] = useState<string[]>([]);
+    const [calendarLoading, setCalendarLoading] = useState(false);
+    const [calendarError, setCalendarError] = useState<string | null>(null);
+
+    // My appointments
+    const [appointments, setAppointments] = useState<Appointment[]>([]);
+    const [loadingAppointments, setLoadingAppointments] = useState(true);
+    const [clinicsLoaded, setClinicsLoaded] = useState(false);
+    const [appointmentsLoaded, setAppointmentsLoaded] = useState(false);
+    const [searchAppointments, setSearchAppointments] = useState("");
+    const [statusFilter, setStatusFilter] = useState<string>("active");
+
+    // Reschedule & cancel
+    const [rescheduleOpen, setRescheduleOpen] = useState(false);
+    const [rescheduleTarget, setRescheduleTarget] = useState<Appointment | null>(null);
+    const [rescheduleDate, setRescheduleDate] = useState("");
+    const [rescheduleTimeStart, setRescheduleTimeStart] = useState("");
+    const [rescheduleSlots, setRescheduleSlots] = useState<Slot[]>([]);
+    const [loadingRescheduleSlots, setLoadingRescheduleSlots] = useState(false);
+    const [rescheduling, setRescheduling] = useState(false);
+
+    const [cancelDialogOpen, setCancelDialogOpen] = useState(false);
+    const [cancelTarget, setCancelTarget] = useState<Appointment | null>(null);
+    const [cancelSubmitting, setCancelSubmitting] = useState(false);
+
+    const initializing = !(clinicsLoaded && appointmentsLoaded);
+
+    const handleClinicChange = (nextClinicId: string) => {
+        setClinicId(nextClinicId);
+        setDoctorId("");
+        setServiceType("");
+        setTimeStart("");
+        setDate("");
+        setCalendarMonth(manilaNow());
+    };
+
+    const handleDoctorChange = (nextDoctorId: string) => {
+        setDoctorId(nextDoctorId);
+        setServiceType("");
+        setTimeStart("");
+        setDate("");
+        setCalendarMonth(manilaNow());
+    };
+
+    const handleSlotSelection = (doctor: Doctor, slot: Slot) => {
+        if (doctor.user_id !== doctorId) {
+            setDoctorId(doctor.user_id);
+            setServiceType("");
+        }
+        setTimeStart(slot.start);
+    };
+
+    const canModifyAppointment = (appointment: Appointment) => {
+        const allowedStatuses = ["Pending", "Approved", "Moved"];
+        if (!allowedStatuses.includes(appointment.status)) return false;
+        const start = new Date(appointment.startISO);
+        return start.getTime() > Date.now();
+    };
+
+    function openRescheduleDialog(appointment: Appointment) {
+        const existingDate = isoToInputDate(appointment.startISO);
+        const effectiveDate = existingDate && existingDate > minBookingDate ? existingDate : minBookingDate;
+
+        setRescheduleTarget(appointment);
+        setRescheduleDate(effectiveDate || minBookingDate);
+        setRescheduleTimeStart("");
+        setRescheduleSlots([]);
+        setRescheduleOpen(true);
+    }
+
+    function closeRescheduleDialog() {
+        setRescheduleOpen(false);
+        setRescheduleTarget(null);
+        setRescheduleDate("");
+        setRescheduleTimeStart("");
+        setRescheduleSlots([]);
+    }
+
+    async function handleRescheduleSubmit(e: React.FormEvent<HTMLFormElement>) {
+        e.preventDefault();
+        if (!rescheduleTarget || !rescheduleDate || !selectedRescheduleSlot) {
+            toast.error("Please choose a new time slot");
+            return;
+        }
+
+        if (rescheduleDate && rescheduleDate < minBookingDate) {
+            toast.error(earliestBookedMessage);
+            return;
+        }
+
+        try {
+            setRescheduling(true);
+            const res = await fetch("/api/patient/appointments", {
+                method: "PATCH",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    appointment_id: rescheduleTarget.id,
+                    date: rescheduleDate,
+                    time_start: selectedRescheduleSlot.start,
+                    time_end: selectedRescheduleSlot.end,
+                }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many reschedule attempts. Please wait before trying again.")) {
+                    return;
+                }
+                toast.error(data?.message ?? "Failed to reschedule appointment");
+                return;
+            }
+            toast.success("Reschedule request sent for doctor approval");
+            closeRescheduleDialog();
+            loadAppointments();
+        } catch {
+            toast.error("Unable to reschedule appointment");
+        } finally {
+            setRescheduling(false);
+        }
+    }
+
+    function openCancelDialog(appointment: Appointment) {
+        setCancelTarget(appointment);
+        setCancelDialogOpen(true);
+    }
+
+    function closeCancelDialog() {
+        setCancelDialogOpen(false);
+        setCancelTarget(null);
+        setCancelSubmitting(false);
+    }
+
+    async function handleCancelConfirm() {
+        if (!cancelTarget) return;
+        try {
+            setCancelSubmitting(true);
+            const res = await fetch("/api/patient/appointments", {
+                method: "DELETE",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ appointment_id: cancelTarget.id }),
+            });
+            const data = await res.json();
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many cancellation attempts. Please wait before trying again.")) {
+                    return;
+                }
+                toast.error(data?.message ?? "Failed to cancel appointment");
+                return;
+            }
+            toast.success("Appointment cancelled");
+            closeCancelDialog();
+            loadAppointments();
+        } catch {
+            toast.error("Unable to cancel appointment");
+        } finally {
+            setCancelSubmitting(false);
+        }
+    }
+
+    // Load clinics
+    useEffect(() => {
+        (async () => {
+            try {
+                setLoadingClinics(true);
+                const res = await fetch("/api/meta/clinics");
+                const data = await res.json();
+                setClinics(data);
+            } catch {
+                toast.error("Failed to load clinics");
+            } finally {
+                setLoadingClinics(false);
+                setClinicsLoaded(true);
+            }
+        })();
+    }, []);
+
+    // Load doctors
+    useEffect(() => {
+        if (!clinicId) {
+            setDoctors([]);
+            setDoctorId("");
+            return;
+        }
+        (async () => {
+            try {
+                setLoadingDoctors(true);
+                const params = new URLSearchParams({ clinic_id: clinicId });
+                const res = await fetch(`/api/meta/doctors?${params}`);
+                const data = await res.json();
+                if (!res.ok) {
+                    if (handleRateLimitError(res, data, "Too many doctor lookups. Please wait before trying again.")) {
+                        setDoctors([]);
+                        return;
+                    }
+                    toast.error(data?.error ?? "Failed to load doctors");
+                    return;
+                }
+                setDoctors(data);
+            } catch {
+                toast.error("Failed to load doctors");
+            } finally {
+                setLoadingDoctors(false);
+            }
+        })();
+    }, [clinicId]);
+
+    // Load available/leave dates for selected doctor
+    useEffect(() => {
+        if (!clinicId || !doctorId) {
+            setAvailableDates([]);
+            setLeaveDates([]);
+            setCalendarError(null);
+            return;
+        }
+
+        const monthKey = formatManilaISODate(calendarMonth).slice(0, 7);
+        let cancelled = false;
+
+        (async () => {
+            try {
+                setCalendarLoading(true);
+                setCalendarError(null);
+                const params = new URLSearchParams({
+                    clinic_id: clinicId,
+                    doctor_user_id: doctorId,
+                    month: monthKey,
+                });
+                const res = await fetch(`/api/meta/doctor-availability/calendar?${params.toString()}`);
+                const data = await res.json();
+
+                if (cancelled) return;
+
+                if (!res.ok) {
+                    setAvailableDates([]);
+                    setLeaveDates([]);
+                    setCalendarError(data?.message ?? "Failed to load schedule overview");
+                    return;
+                }
+
+                setAvailableDates(Array.isArray(data?.availableDates) ? data.availableDates : []);
+                setLeaveDates(Array.isArray(data?.leaveDates) ? data.leaveDates : []);
+            } catch (err) {
+                if (cancelled) return;
+                console.error(err);
+                setAvailableDates([]);
+                setLeaveDates([]);
+                setCalendarError("Unable to load schedule overview");
+            } finally {
+                if (!cancelled) {
+                    setCalendarLoading(false);
+                }
+            }
+        })();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [calendarMonth, clinicId, doctorId]);
+
+    // Load availability for doctors when clinic/date change
+    useEffect(() => {
+        if (!clinicId || doctors.length === 0) {
+            setDoctorAvailability({});
+            return;
+        }
+
+        if (!date) {
+            const emptyAvailability: Record<
+                string,
+                { slots: Slot[]; loading: boolean; error: string | null; onLeave: boolean }
+            > = {};
+            doctors.forEach((doctor) => {
+                emptyAvailability[doctor.user_id] = {
+                    slots: [],
+                    loading: false,
+                    error: null,
+                    onLeave: false,
+                };
+            });
+            setDoctorAvailability(emptyAvailability);
+            return;
+        }
+
+        let cancelled = false;
+
+        setDoctorAvailability((prev) => {
+            const next: typeof prev = {};
+            doctors.forEach((doctor) => {
+                const existing = prev[doctor.user_id];
+                next[doctor.user_id] = {
+                    slots: existing?.slots ?? [],
+                    loading: true,
+                    error: null,
+                    onLeave: existing?.onLeave ?? false,
+                };
+            });
+            return next;
+        });
+
+        const loadAvailability = async (doctor: Doctor) => {
+            try {
+                const params = new URLSearchParams({
+                    clinic_id: clinicId,
+                    doctor_user_id: doctor.user_id,
+                    date,
+                });
+                const res = await fetch(`/api/meta/doctor-availability?${params}`);
+                const data = await res.json();
+
+                if (cancelled) return;
+
+                if (!res.ok) {
+                    if (handleRateLimitError(
+                        res,
+                        data,
+                        "Too many availability checks. Please wait before trying again."
+                    )) {
+                        return;
+                    }
+                    setDoctorAvailability((prev) => ({
+                        ...prev,
+                        [doctor.user_id]: {
+                            slots: [],
+                            loading: false,
+                            error: data?.error ?? "Failed to load availability",
+                            onLeave: false,
+                        },
+                    }));
+                    return;
+                }
+
+                setDoctorAvailability((prev) => ({
+                    ...prev,
+                    [doctor.user_id]: {
+                        slots: data?.slots || [],
+                        loading: false,
+                        error: null,
+                        onLeave: Boolean(data?.onLeave),
+                    },
+                }));
+            } catch {
+                if (cancelled) return;
+
+                setDoctorAvailability((prev) => ({
+                    ...prev,
+                    [doctor.user_id]: {
+                        slots: [],
+                        loading: false,
+                        error: "Failed to load availability",
+                        onLeave: false,
+                    },
+                }));
+            }
+        };
+
+        doctors.forEach((doctor) => {
+            void loadAvailability(doctor);
+        });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [clinicId, date, doctors]);
+
+    const selectedDoctorAvailability = doctorId ? doctorAvailability[doctorId] : undefined;
+    const slots = useMemo(() => selectedDoctorAvailability?.slots ?? [], [selectedDoctorAvailability]);
+    const loadingSlots = selectedDoctorAvailability?.loading ?? false;
+    const selectedDoctorAvailabilityError = selectedDoctorAvailability?.error ?? null;
+    const onLeaveDay = selectedDoctorAvailability?.onLeave ?? false;
+    const selectedSlot = useMemo(() => slots.find((s) => s.start === timeStart), [slots, timeStart]);
+    const selectedDoctor = useMemo(() => doctors.find((d) => d.user_id === doctorId) || null, [doctorId, doctors]);
+    const selectedDate = useMemo(() => (date ? new Date(`${date}T00:00:00+08:00`) : undefined), [date]);
+    const availableDateObjects = useMemo(
+        () => availableDates.map((value) => new Date(`${value}T00:00:00+08:00`)),
+        [availableDates]
+    );
+    const leaveDateObjects = useMemo(
+        () => leaveDates.map((value) => new Date(`${value}T00:00:00+08:00`)),
+        [leaveDates]
+    );
+    const leaveDateSet = useMemo(() => new Set(leaveDates), [leaveDates]);
+    const availableDateSet = useMemo(() => new Set(availableDates), [availableDates]);
+    const selectedClinic = useMemo(
+        () => clinics.find((clinic) => clinic.clinic_id === clinicId) ?? null,
+        [clinics, clinicId]
+    );
+    const selectedRescheduleSlot = useMemo(
+        () => rescheduleSlots.find((s) => s.start === rescheduleTimeStart) ?? null,
+        [rescheduleSlots, rescheduleTimeStart]
+    );
+
+    useEffect(() => {
+        setRescheduleTimeStart("");
+    }, [rescheduleDate]);
+
+    useEffect(() => {
+        setTimeStart("");
+    }, [date]);
+
+    useEffect(() => {
+        if (!doctorId) return;
+        const exists = doctors.some((doctor) => doctor.user_id === doctorId);
+        if (!exists) {
+            setDoctorId("");
+            setServiceType("");
+            setTimeStart("");
+        }
+    }, [doctorId, doctors]);
+
+    useEffect(() => {
+        setDate((current) => {
+            if (!current) return current;
+            return current < minBookingDate ? minBookingDate : current;
+        });
+    }, [minBookingDate]);
+
+    useEffect(() => {
+        if (!rescheduleOpen) return;
+        setRescheduleDate((current) => {
+            if (!current) return minBookingDate;
+            return current < minBookingDate ? minBookingDate : current;
+        });
+    }, [minBookingDate, rescheduleOpen]);
+
+    useEffect(() => {
+        if (!rescheduleTarget) {
+            setRescheduleSlots([]);
+            setLoadingRescheduleSlots(false);
+            return;
+        }
+        if (!rescheduleDate) {
+            setRescheduleSlots([]);
+            setLoadingRescheduleSlots(false);
+            return;
+        }
+
+        (async () => {
+            try {
+                setLoadingRescheduleSlots(true);
+                const params = new URLSearchParams({
+                    clinic_id: rescheduleTarget.clinicId,
+                    doctor_user_id: rescheduleTarget.doctorId,
+                    date: rescheduleDate,
+                });
+                const res = await fetch(`/api/meta/doctor-availability?${params}`);
+                const data = await res.json();
+                if (!res.ok) {
+                    if (
+                        handleRateLimitError(
+                            res,
+                            data,
+                            "Too many availability checks. Please wait before trying again."
+                        )
+                    ) {
+                        setRescheduleSlots([]);
+                        return;
+                    }
+                    toast.error(data?.error ?? "Failed to load reschedule slots");
+                    setRescheduleSlots([]);
+                    return;
+                }
+                setRescheduleSlots(data?.slots || []);
+            } catch {
+                toast.error("Failed to load reschedule slots");
+            } finally {
+                setLoadingRescheduleSlots(false);
+            }
+        })();
+    }, [rescheduleTarget, rescheduleDate]);
+
+    // Dynamic service options: each label has a unique value
+    const availableServices = useMemo(
+        () => getServiceOptionsForSpecialization(selectedDoctor?.specialization ?? null),
+        [selectedDoctor]
+    );
+
+    const selectedServiceLabel = useMemo(() => {
+        const match = availableServices.find((service) => service.value === serviceType);
+        return match?.label ?? null;
+    }, [availableServices, serviceType]);
+
+    // Submit appointment
+    async function handleSubmit(e: React.FormEvent) {
+        e.preventDefault();
+        if (!clinicId || !doctorId || !serviceType || !date || !selectedSlot) {
+            toast.error("Please complete all fields");
+            return;
+        }
+
+        const matchedService = availableServices.find((service) => service.value === serviceType);
+        const serviceEnumValue = matchedService?.serviceType ?? resolveServiceType(serviceType);
+
+        if (!serviceEnumValue) {
+            toast.error("Select a valid service type");
+            return;
+        }
+
+        if (date < minBookingDate) {
+            toast.error(earliestBookedMessage);
+            return;
+        }
+
+        try {
+            setSubmitting(true);
+            const res = await fetch("/api/patient/appointments", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    clinic_id: clinicId,
+                    doctor_user_id: doctorId,
+                    service_type: serviceEnumValue,
+                    date,
+                    time_start: selectedSlot.start,
+                    time_end: selectedSlot.end,
+                }),
+            });
+
+            const data = await res.json();
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many appointment requests. Please try again later.")) {
+                    return;
+                }
+                toast.error(data?.message ?? "Unable to create appointment");
+                return;
+            }
+
+            toast.success("Appointment request submitted! Status: Pending");
+            loadAppointments();
+
+            setClinicId("");
+            setDoctorId("");
+            setServiceType("");
+            setDate("");
+            setTimeStart("");
+        } catch {
+            toast.error("Unable to create appointment");
+        } finally {
+            setSubmitting(false);
+        }
+    }
+
+    // Fetch appointments
+    async function loadAppointments() {
+        try {
+            setLoadingAppointments(true);
+            const res = await fetch("/api/patient/appointments");
+            const data = await res.json();
+            if (!res.ok) {
+                if (handleRateLimitError(res, data, "Too many appointment lookups. Please try again later.")) {
+                    return;
+                }
+                throw new Error("Failed to load appointments");
+            }
+            setAppointments(Array.isArray(data) ? data : []);
+        } catch {
+            toast.error("Could not load your appointments");
+        } finally {
+            setLoadingAppointments(false);
+            setAppointmentsLoaded(true);
+        }
+    }
+
+    useEffect(() => {
+        loadAppointments();
+    }, []);
+
+    const appointmentSearch = searchAppointments.trim().toLowerCase();
+
+    const filteredAppointments = useMemo(() => {
+        return appointments.filter((appointment) => {
+            const status = normalizeStatus(appointment.status);
+            if (statusFilter && statusFilter !== "all") {
+                if (statusFilter === "active" && (!status || !ACTIVE_STATUSES.includes(status))) {
+                    return false;
+                }
+                if (statusFilter !== "active") {
+                    const matchStatus = STATUS_VALUE_MAP[statusFilter];
+                    if (!matchStatus || status !== matchStatus) {
+                        return false;
+                    }
+                }
+            }
+
+            if (!appointmentSearch) return true;
+
+            const haystack = [
+                appointment.clinic,
+                appointment.doctor,
+                appointment.status,
+                appointment.serviceType ?? "",
+                appointment.date,
+                appointment.time,
+            ]
+                .join(" ")
+                .toLowerCase();
+
+            return haystack.includes(appointmentSearch);
+        });
+    }, [appointmentSearch, appointments, statusFilter]);
+
+    const statusCounts = useMemo(() => {
+        const counts: Record<AppointmentStatus, number> = {
+            Pending: 0,
+            Approved: 0,
+            Moved: 0,
+            Completed: 0,
+            Cancelled: 0,
+        };
+
+        for (const appointment of appointments) {
+            const status = normalizeStatus(appointment.status);
+            if (status) {
+                counts[status] += 1;
+            }
+        }
+
+        return counts;
+    }, [appointments]);
+
+    const activeAppointments = useMemo(
+        () =>
+            appointments.filter((appointment) => {
+                const status = normalizeStatus(appointment.status);
+                return status ? ACTIVE_STATUSES.includes(status) : false;
+            }),
+        [appointments]
+    );
+
+    const upcomingAppointments = useMemo(
+        () =>
+            activeAppointments.filter((appointment) => {
+                const start = appointment.startISO ? new Date(appointment.startISO) : null;
+                return start ? start.getTime() >= Date.now() : false;
+            }),
+        [activeAppointments]
+    );
+
+    const nextAppointment = useMemo(() => {
+        const sorted = [...upcomingAppointments].sort((a, b) => {
+            const startA = a.startISO ? new Date(a.startISO).getTime() : Number.POSITIVE_INFINITY;
+            const startB = b.startISO ? new Date(b.startISO).getTime() : Number.POSITIVE_INFINITY;
+            return startA - startB;
+        });
+        return sorted[0] ?? null;
+    }, [upcomingAppointments]);
+
+    if (initializing) {
+        return <PatientAppointmentsLoading />;
+    }
+
+    return (
+        <PatientLayout
+            title="Appointments"
+            description="Plan and manage your clinic visits — from booking a slot to tracking approvals and changes."
+            actions={
+                <div className="hidden items-center gap-3 rounded-2xl border border-primary/25 bg-white/80 px-4 py-2 text-xs font-medium text-primary shadow-sm md:flex">
+                    <CalendarDays className="h-4 w-4" />
+                    Earliest booking: {formatDateOnly(minBookingDate) || minBookingDate}
+                </div>
+            }
+        >
+            <section className="mx-auto w-full max-w-5xl space-y-8">
+                <Card className="rounded-3xl border-primary/25 bg-white/95 shadow-sm">
+                    <CardHeader className="space-y-1 border-b border-primary/15 pb-5">
+                        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+                            <div className="space-y-1">
+                                <CardTitle className="flex items-center gap-3 text-lg font-semibold text-primary">
+                                    <span className="flex h-11 w-11 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+                                        <CalendarDays className="h-5 w-5" />
+                                    </span>
+                                    Schedule an Appointment
+                                </CardTitle>
+                                <p className="text-sm text-muted-foreground">
+                                    Browse open dates, pick a slot, and submit your request in one place.
+                                </p>
+                            </div>
+                        </div>
+                    </CardHeader>
+
+                    <CardContent className="space-y-6 pt-6">
+                        <form className="space-y-6" onSubmit={handleSubmit}>
+                            <div className="grid min-w-0 gap-4 md:grid-cols-2 xl:grid-cols-3">
+                                <div className="grid min-w-0 gap-2">
+                                    <Label htmlFor="appointment-clinic" className="text-sm font-medium text-primary">
+                                        Clinic
+                                    </Label>
+                                    <Select value={clinicId} onValueChange={handleClinicChange} disabled={loadingClinics}>
+                                        <SelectTrigger
+                                            id="appointment-clinic"
+                                            className="w-full min-w-0 rounded-xl border-primary/30 bg-white"
+                                        >
+                                            <SelectValue placeholder={loadingClinics ? "Loading clinics..." : "Select clinic"} />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {clinics.map((clinic) => (
+                                                <SelectItem key={clinic.clinic_id} value={clinic.clinic_id}>
+                                                    {clinic.clinic_name}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+
+                                <div className="grid min-w-0 gap-2">
+                                    <Label htmlFor="appointment-doctor" className="text-sm font-medium text-primary">
+                                        Doctor
+                                    </Label>
+                                    <Select
+                                        value={doctorId}
+                                        onValueChange={handleDoctorChange}
+                                        disabled={!clinicId || loadingDoctors}
+                                    >
+                                        <SelectTrigger
+                                            id="appointment-doctor"
+                                            className="w-full min-w-0 rounded-xl border-primary/30 bg-white"
+                                        >
+                                            <SelectValue
+                                                placeholder={
+                                                    !clinicId ? "Select clinic first" : loadingDoctors ? "Loading doctors..." : "Select doctor"
+                                                }
+                                            />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {doctors.map((doctor) => (
+                                                <SelectItem key={doctor.user_id} value={doctor.user_id}>
+                                                    {doctor.name} ({doctor.specialization ?? "N/A"})
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+
+                                <div className="grid min-w-0 gap-2 md:col-span-2 xl:col-span-1">
+                                    <Label htmlFor="appointment-service" className="text-sm font-medium text-primary">
+                                        Service type
+                                    </Label>
+                                    <Select value={serviceType} onValueChange={setServiceType} disabled={!selectedDoctor}>
+                                        <SelectTrigger
+                                            id="appointment-service"
+                                            className="w-full min-w-0 rounded-xl border-primary/30 bg-white"
+                                        >
+                                            <SelectValue placeholder={!selectedDoctor ? "Select doctor first" : "Select service"} />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            {availableServices.map((service) => (
+                                                <SelectItem key={service.value} value={service.value}>
+                                                    {service.label}
+                                                </SelectItem>
+                                            ))}
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                            </div>
+
+                            <div className="space-y-4">
+                                {!clinicId || !doctorId ? (
+                                    <div className="rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-muted-foreground">
+                                        Select a clinic and doctor first to preview their availability.
+                                    </div>
+                                ) : null}
+
+                                <div className="grid gap-6 xl:grid-cols-[minmax(0,380px)_1fr]">
+                                    <div className="rounded-2xl border border-primary/20 bg-white/80 shadow-inner">
+                                        <div className="px-4 py-3">
+                                            <p className="text-xs font-semibold uppercase tracking-wide text-primary">Month overview</p>
+                                            <p className="text-sm text-muted-foreground">
+                                                {selectedDoctor?.name ? `Availability for ${selectedDoctor.name}` : "Pick a doctor to load availability"}
+                                            </p>
+                                        </div>
+                                        <div className="relative px-3 pb-4 pt-2 sm:px-4">
+                                            {calendarLoading ? (
+                                                <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-2xl bg-white/70 backdrop-blur-sm">
+                                                    <Loader2 className="h-5 w-5 animate-spin text-primary" />
+                                                </div>
+                                            ) : null}
+                                            <Calendar
+                                                mode="single"
+                                                month={calendarMonth}
+                                                onMonthChange={setCalendarMonth}
+                                                selected={selectedDate}
+                                                onSelect={(value) => {
+                                                    if (value) {
+                                                        setDate(formatManilaISODate(value));
+                                                        setTimeStart("");
+                                                        setCalendarMonth(value);
+                                                    }
+                                                }}
+                                                disabled={(day) => {
+                                                    const dayKey = formatManilaISODate(day);
+                                                    if (dayKey < minBookingDate) return true;
+                                                    if (leaveDateSet.has(dayKey)) return true;
+                                                    return !availableDateSet.has(dayKey);
+                                                }}
+                                                modifiers={{ available: availableDateObjects, leave: leaveDateObjects }}
+                                                modifiersClassNames={{
+                                                    available:
+                                                        "[&>button]:border [&>button]:border-emerald-200 [&>button]:bg-emerald-50 [&>button]:text-emerald-700 [&>button[data-selected-single=true]]:!border-transparent [&>button[data-selected-single=true]]:!bg-emerald-500 [&>button[data-selected-single=true]]:!text-white [&>button[data-selected-single=true]]:!shadow-[0_10px_30px_-12px_rgba(16,185,129,0.55)] [&>button[data-selected-single=true]]:!ring-2 [&>button[data-selected-single=true]]:!ring-emerald-200/70 [&>button[data-selected-single=true]]:!ring-offset-0",
+                                                    leave:
+                                                        "[&>button]:border [&>button]:border-amber-200 [&>button]:bg-amber-50 [&>button]:text-amber-700 [&>button[data-selected-single=true]]:!border-transparent [&>button[data-selected-single=true]]:!bg-amber-500 [&>button[data-selected-single=true]]:!text-white",
+                                                }}
+                                                className="mx-auto w-full max-w-sm [--cell-size:2.4rem] sm:[--cell-size:2.7rem] [&_button[data-selected-single=true]]:border-transparent! [&_button[data-selected-single=true]]:bg-emerald-500! [&_button[data-selected-single=true]]:text-white! [&_button[data-selected-single=true]]:shadow-[0_10px_30px_-12px_rgba(16,185,129,0.55)]! [&_button[data-selected-single=true]]:ring-2! [&_button[data-selected-single=true]]:ring-emerald-200/70! [&_button[data-selected-single=true]]:ring-offset-0! [&_button[data-selected-single=true]]:outline-none! [&_button[data-selected-single=true]]:transition [&_button[data-selected-single=true]]:duration-150 [&_button[data-selected-single=true]]:ease-out [&_button[data-selected-single=true]]:scale-[1.02]"
+                                            />
+                                            <div className="mt-3 flex flex-wrap gap-3 text-xs text-muted-foreground">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="h-2 w-2 rounded-full bg-emerald-500" /> Available date
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <span className="h-2 w-2 rounded-full bg-amber-500" /> Leave day
+                                                </div>
+                                            </div>
+                                            {calendarError ? (
+                                                <p className="mt-3 text-xs text-rose-600">{calendarError}</p>
+                                            ) : null}
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-3">
+                                        <div className="space-y-1">
+                                            <p className="text-xs font-semibold uppercase tracking-wide text-primary">Selected day</p>
+                                            <h3 className="text-lg font-semibold text-slate-900">
+                                                {selectedDate ? formatDateOnly(date) : "Choose a date"}
+                                            </h3>
+                                            <p className="text-sm text-muted-foreground">
+                                                {!selectedDate
+                                                    ? "Pick a date to view open slots."
+                                                    : onLeaveDay || leaveDates.includes(date)
+                                                        ? `${selectedDoctor?.name ?? "Doctor"} is on leave for this day.`
+                                                        : slots.length > 0
+                                                            ? "Select a time to include in your request."
+                                                            : "No open times for this day."}
+                                            </p>
+                                        </div>
+
+                                        {!selectedDate ? (
+                                            <div className="rounded-2xl border border-dashed border-primary/30 bg-primary/10/50 p-6 text-sm text-muted-foreground">
+                                                Choose a date on the calendar to view available times.
+                                            </div>
+                                        ) : loadingSlots ? (
+                                            <div className="flex items-center gap-2 rounded-2xl border border-primary/25 bg-white p-3 text-sm text-muted-foreground">
+                                                <Loader2 className="h-4 w-4 animate-spin" /> Checking availability...
+                                            </div>
+                                        ) : selectedDoctorAvailabilityError ? (
+                                            <div className="rounded-2xl border border-rose-100 bg-rose-50/60 p-3 text-sm text-rose-700">
+                                                Unable to load the schedule for this doctor. Try again later.
+                                            </div>
+                                        ) : onLeaveDay || leaveDates.includes(date) ? (
+                                            <div className="rounded-2xl border border-amber-200 bg-amber-50/70 p-3 text-sm text-amber-800">
+                                                This doctor is marked as on leave for {formatDateOnly(date)}.
+                                            </div>
+                                        ) : slots.length > 0 ? (
+                                            <div className="grid gap-2 sm:grid-cols-2">
+                                                {slots.map((slot) => {
+                                                    const isSelected = timeStart === slot.start;
+                                                    return (
+                                                        <button
+                                                            key={`${doctorId}-${slot.start}-${slot.end}`}
+                                                            type="button"
+                                                            disabled={
+                                                                onLeaveDay ||
+                                                                leaveDateSet.has(date) ||
+                                                                !availableDateSet.has(date)
+                                                            }
+                                                            onClick={() => selectedDoctor && handleSlotSelection(selectedDoctor, slot)}
+                                                            className={cn(
+                                                                "flex w-full flex-col items-start gap-1 rounded-2xl border px-3 py-2 text-left text-sm font-medium transition",
+                                                                "border-primary/25 bg-white text-primary hover:bg-primary/10 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-primary",
+                                                                isSelected && "border-primary bg-primary text-white hover:bg-primary/90 focus-visible:outline-primary",
+                                                                (onLeaveDay || leaveDateSet.has(date) || !availableDateSet.has(date)) &&
+                                                                "cursor-not-allowed opacity-60 hover:bg-white"
+                                                            )}
+                                                            aria-pressed={isSelected}
+                                                        >
+                                                            <span className="leading-tight">{formatTimeRange(slot.start, slot.end)}</span>
+                                                            <span
+                                                                className={cn(
+                                                                    "text-xs font-medium leading-tight",
+                                                                    isSelected ? "text-white/80" : "text-muted-foreground"
+                                                                )}
+                                                            >
+                                                                {isSelected ? "Selected" : "Available"}
+                                                            </span>
+                                                        </button>
+                                                    );
+                                                })}
+                                            </div>
+                                        ) : (
+                                            <div className="rounded-2xl border border-rose-100 bg-rose-50/60 p-3 text-sm text-rose-700">
+                                                No available slots for this date. Try another day.
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                                <div className="rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-3 text-sm text-primary">
+                                    Appointment must be scheduled at least 3 days prior.
+                                </div>
+                                <Button
+                                    type="submit"
+                                    className="w-full rounded-xl bg-primary py-2 text-sm font-semibold text-white shadow-sm hover:bg-primary/90 lg:w-auto"
+                                    disabled={submitting}
+                                >
+                                    {submitting ? (
+                                        <>
+                                            <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Submitting...
+                                        </>
+                                    ) : (
+                                        "Request appointment"
+                                    )}
+                                </Button>
+                            </div>
+                        </form>
+                    </CardContent>
+                </Card>
+
+                <div className="grid gap-6 lg:grid-cols-2 2xl:gap-8">
+                    <Card className="rounded-3xl border-primary/25 bg-linear-to-br from-primary via-primary/90 to-primary/80 text-white shadow-md">
+                        <CardHeader>
+                            <CardTitle className="text-lg">Important reminders</CardTitle>
+                        </CardHeader>
+                        <CardContent className="space-y-3 text-sm text-white/90">
+                            <p>Bring your Student/Employee ID and arrive 10 minutes early for screening and verification.</p>
+                            <p>If you can no longer attend, submit a reschedule or cancellation so another patient can use the slot.</p>
+                            <p>Watch your notifications for approvals, movement updates, and doctor instructions.</p>
+                        </CardContent>
+                    </Card>
+
+                    <Card className="rounded-3xl border-primary/25 bg-white/90 shadow-sm">
+                        <CardHeader>
+                            <CardTitle className="text-lg text-primary">Booking summary</CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                            <dl className="space-y-3 text-sm text-muted-foreground">
+                                <div className="rounded-2xl border border-primary/25 bg-primary/5 p-3">
+                                    <dt className="text-xs uppercase tracking-wide text-primary">Clinic</dt>
+                                    <dd className="mt-1 text-sm font-medium text-primary">
+                                        {selectedClinic ? selectedClinic.clinic_name : "Select a clinic to continue"}
+                                    </dd>
+                                </div>
+                                <div className="rounded-2xl border border-primary/25 bg-primary/5 p-3">
+                                    <dt className="text-xs uppercase tracking-wide text-primary">Doctor</dt>
+                                    <dd className="mt-1 text-sm font-medium text-primary">
+                                        {selectedDoctor
+                                            ? `${selectedDoctor.name} ${selectedDoctor.specialization ? `(${selectedDoctor.specialization})` : ""}`
+                                            : "Choose a clinic and doctor"}
+                                    </dd>
+                                </div>
+                                <div className="rounded-2xl border border-primary/25 bg-primary/5 p-3">
+                                    <dt className="text-xs uppercase tracking-wide text-primary">Service</dt>
+                                    <dd className="mt-1 text-sm font-medium text-primary">
+                                        {selectedServiceLabel ?? "Select a service type"}
+                                    </dd>
+                                </div>
+                                <div className="rounded-2xl border border-primary/25 bg-primary/5 p-3">
+                                    <dt className="text-xs uppercase tracking-wide text-primary">Schedule</dt>
+                                    <dd className="mt-1 text-sm font-medium text-primary">
+                                        {date && selectedSlot ? (
+                                            <span>
+                                                {formatDateOnly(date)} · {formatTimeRange(selectedSlot.start, selectedSlot.end)}
+                                            </span>
+                                        ) : (
+                                            "Choose a date and time"
+                                        )}
+                                    </dd>
+                                </div>
+                            </dl>
+                        </CardContent>
+                    </Card>
+                </div>
+            </section>
+            <section className="space-y-6 min-w-0">
+                <div className="grid gap-4 md:grid-cols-3">
+                    <Card className="rounded-3xl border-primary/25 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">Active requests</CardTitle>
+                                <p className="text-sm text-muted-foreground">Pending, approved, and moved appointments</p>
+                            </div>
+                            <Clock3 className="h-9 w-9 text-primary" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{activeAppointments.length}</p>
+                        </CardContent>
+                    </Card>
+                    <Card className="rounded-3xl border-primary/25 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">Next visit</CardTitle>
+                                <p className="text-sm text-muted-foreground">Your soonest approved appointment</p>
+                            </div>
+                            <CalendarDays className="h-9 w-9 text-primary" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{upcomingAppointments.length}</p>
+                            {nextAppointment ? (
+                                <p className="mt-2 text-xs text-muted-foreground">
+                                    {formatAppointmentDate(nextAppointment)} • {formatAppointmentTime(nextAppointment)}
+                                </p>
+                            ) : null}
+                        </CardContent>
+                    </Card>
+                    <Card className="rounded-3xl border-primary/25 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">Pending approvals</CardTitle>
+                                <p className="text-sm text-muted-foreground">Requests awaiting confirmation</p>
+                            </div>
+                            <AlertCircle className="h-9 w-9 text-amber-500" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{statusCounts.Pending}</p>
+                        </CardContent>
+                    </Card>
+                </div>
+
+                <AppointmentPanel
+                    icon={ClipboardList}
+                    title="Appointment board"
+                    description="Track approval status, reschedule upcoming visits, or cancel when plans change."
+                    actions={
+                        <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                            <div className="flex items-center gap-2">
+                                <span className="h-2 w-2 rounded-full bg-primary" /> Confirmed
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <span className="h-2 w-2 rounded-full bg-amber-500" /> Pending
+                            </div>
+                        </div>
+                    }
+                    contentClassName="pt-4"
+                >
+                    <div className="flex flex-col gap-4">
+                        <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_200px]">
+                            <div className="space-y-2">
+                                <Label htmlFor="appointment-search" className="text-sm font-medium text-primary">
+                                    Search requests
+                                </Label>
+                                <div className="relative">
+                                    <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                                    <Input
+                                        id="appointment-search"
+                                        name="appointmentSearch"
+                                        placeholder="Search by clinic, doctor, or status"
+                                        value={searchAppointments}
+                                        onChange={(event) => setSearchAppointments(event.target.value)}
+                                        className="rounded-xl border-primary/30 pl-9"
+                                    />
+                                </div>
+                            </div>
+                            <div className="space-y-2">
+                                <Label htmlFor="appointment-status-filter" className="text-sm font-medium text-primary">
+                                    Status filter
+                                </Label>
+                                <Select value={statusFilter} onValueChange={setStatusFilter}>
+                                    <SelectTrigger id="appointment-status-filter" className="rounded-xl border-primary/30">
+                                        <SelectValue placeholder="All statuses" />
+                                    </SelectTrigger>
+                                    <SelectContent>
+                                        <SelectItem value="all">All statuses</SelectItem>
+                                        <SelectItem value="active">Active requests</SelectItem>
+                                        {STATUS_ORDER.map((status) => (
+                                            <SelectItem key={status} value={status.toLowerCase()}>
+                                                {STATUS_LABELS[status]}
+                                            </SelectItem>
+                                        ))}
+                                    </SelectContent>
+                                </Select>
+                            </div>
+                        </div>
+
+                        <div className="overflow-x-auto">
+                            <Table>
+                                <TableHeader>
+                                    <TableRow className="text-xs uppercase tracking-wide text-muted-foreground">
+                                        <TableHead className="min-w-45">Clinic</TableHead>
+                                        <TableHead className="min-w-40">Doctor</TableHead>
+                                        <TableHead className="min-w-30">Date</TableHead>
+                                        <TableHead className="min-w-30">Time</TableHead>
+                                        <TableHead className="min-w-30">Status</TableHead>
+                                        <TableHead className="w-27.5 text-right">Actions</TableHead>
+                                    </TableRow>
+                                </TableHeader>
+                                <TableBody>
+                                    {loadingAppointments ? (
+                                        <TableRow>
+                                            <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
+                                                <div className="flex items-center justify-center gap-2 text-sm">
+                                                    <Loader2 className="h-4 w-4 animate-spin" /> Loading appointments...
+                                                </div>
+                                            </TableCell>
+                                        </TableRow>
+                                    ) : filteredAppointments.length === 0 ? (
+                                        <TableRow>
+                                            <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
+                                                No appointments match your filters.
+                                            </TableCell>
+                                        </TableRow>
+                                    ) : (
+                                        filteredAppointments.map((appointment) => {
+                                            const status = normalizeStatus(appointment.status);
+                                            const statusLabel = status ? STATUS_LABELS[status] : appointment.status;
+                                            const statusClasses = status
+                                                ? STATUS_BADGE_CLASSES[status]
+                                                : "border-slate-200 bg-slate-100 text-slate-700";
+                                            const canModify = canModifyAppointment(appointment);
+                                            const isRescheduling = rescheduling && rescheduleTarget?.id === appointment.id;
+                                            const isCancelling = cancelSubmitting && cancelTarget?.id === appointment.id;
+
+                                            return (
+                                                <TableRow key={appointment.id} className="text-sm">
+                                                    <TableCell className="font-medium text-primary">
+                                                        <div className="flex flex-col">
+                                                            <span>{appointment.clinic}</span>
+                                                            <span className="text-xs text-muted-foreground">
+                                                                {humanizeService(appointment.serviceType)}
+                                                            </span>
+                                                        </div>
+                                                    </TableCell>
+                                                    <TableCell>{appointment.doctor}</TableCell>
+                                                    <TableCell>{formatAppointmentDate(appointment)}</TableCell>
+                                                    <TableCell>{formatAppointmentTime(appointment)}</TableCell>
+                                                    <TableCell>
+                                                        <Badge className={`rounded-full px-2 py-1 text-xs ${statusClasses}`}>
+                                                            {statusLabel}
+                                                        </Badge>
+                                                    </TableCell>
+                                                    <TableCell className="text-right">
+                                                        {canModify ? (
+                                                            <DropdownMenu>
+                                                                <DropdownMenuTrigger asChild>
+                                                                    <Button
+                                                                        variant="ghost"
+                                                                        size="sm"
+                                                                        className="rounded-xl text-primary hover:bg-primary/15"
+                                                                        disabled={isRescheduling || isCancelling}
+                                                                    >
+                                                                        {isRescheduling || isCancelling ? (
+                                                                            <Loader2 className="h-4 w-4 animate-spin" />
+                                                                        ) : (
+                                                                            <MoreHorizontal className="h-4 w-4" />
+                                                                        )}
+                                                                    </Button>
+                                                                </DropdownMenuTrigger>
+                                                                <DropdownMenuContent align="end" className="w-48 rounded-xl border-primary/25">
+                                                                    <DropdownMenuItem
+                                                                        onClick={() => openRescheduleDialog(appointment)}
+                                                                        disabled={isRescheduling || isCancelling}
+                                                                    >
+                                                                        {isRescheduling ? (
+                                                                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                                                        ) : (
+                                                                            <Undo2 className="mr-2 h-4 w-4" />
+                                                                        )}
+                                                                        Reschedule
+                                                                    </DropdownMenuItem>
+                                                                    <DropdownMenuItem
+                                                                        onClick={() => openCancelDialog(appointment)}
+                                                                        disabled={isCancelling || isRescheduling}
+                                                                        className="text-red-600 focus:text-red-600"
+                                                                    >
+                                                                        {isCancelling ? (
+                                                                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                                                                        ) : (
+                                                                            <Ban className="mr-2 h-4 w-4" />
+                                                                        )}
+                                                                        Cancel
+                                                                    </DropdownMenuItem>
+                                                                </DropdownMenuContent>
+                                                            </DropdownMenu>
+                                                        ) : (
+                                                            <span className="text-xs text-muted-foreground">No actions available</span>
+                                                        )}
+                                                    </TableCell>
+                                                </TableRow>
+                                            );
+                                        })
+                                    )}
+                                </TableBody>
+                            </Table>
+                        </div>
+                    </div>
+                </AppointmentPanel>
+            </section>
+
+            <Dialog
+                open={rescheduleOpen}
+                onOpenChange={(open) => {
+                    if (!open) closeRescheduleDialog();
+                }}
+            >
+                <DialogContent className="max-w-md rounded-3xl border border-primary/25 bg-white/95">
+                    <DialogHeader className="space-y-1">
+                        <DialogTitle className="text-lg font-semibold text-primary">Reschedule appointment</DialogTitle>
+                        <DialogDescription>
+                            {rescheduleTarget
+                                ? `Select a new slot for your appointment with ${rescheduleTarget.doctor}. We'll send the request to the clinic for approval. ${earliestBookedMessage}`
+                                : "Choose a new schedule for your appointment. We'll submit it for doctor approval."}
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    <form onSubmit={handleRescheduleSubmit} className="space-y-4 pt-2">
+                        <div className="space-y-2">
+                            <Label htmlFor="reschedule-date" className="text-sm font-medium text-primary">
+                                Date
+                            </Label>
+                            <Input
+                                id="reschedule-date"
+                                name="rescheduleDate"
+                                type="date"
+                                value={rescheduleDate}
+                                onChange={(event) => setRescheduleDate(event.target.value)}
+                                min={minBookingDate}
+                                required
+                                disabled={rescheduling}
+                                className="rounded-xl border-primary/30"
+                            />
+                        </div>
+
+                        <div className="space-y-2">
+                            <Label htmlFor="reschedule-time" className="text-sm font-medium text-primary">
+                                Time
+                            </Label>
+                            <Select
+                                value={rescheduleTimeStart}
+                                onValueChange={setRescheduleTimeStart}
+                                disabled={
+                                    !rescheduleTarget ||
+                                    loadingRescheduleSlots ||
+                                    rescheduling ||
+                                    rescheduleSlots.length === 0
+                                }
+                            >
+                                <SelectTrigger id="reschedule-time" className="rounded-xl border-primary/30">
+                                    <SelectValue
+                                        placeholder={
+                                            !rescheduleTarget
+                                                ? "Select appointment"
+                                                : loadingRescheduleSlots
+                                                    ? "Loading slots..."
+                                                    : rescheduleSlots.length
+                                                        ? "Select a time"
+                                                        : "No slots available"
+                                        }
+                                    />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    {rescheduleSlots.map((slot) => (
+                                        <SelectItem key={`${slot.start}-${slot.end}`} value={slot.start}>
+                                            {formatTimeRange(slot.start, slot.end)}
+                                        </SelectItem>
+                                    ))}
+                                </SelectContent>
+                            </Select>
+                        </div>
+
+                        <DialogFooter>
+                            <Button
+                                type="submit"
+                                className="rounded-xl bg-primary text-sm font-semibold text-white hover:bg-primary/90"
+                                disabled={rescheduling || !rescheduleTarget || !selectedRescheduleSlot}
+                            >
+                                {rescheduling ? (
+                                    <>
+                                        <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Submitting...
+                                    </>
+                                ) : (
+                                    "Confirm"
+                                )}
+                            </Button>
+                        </DialogFooter>
+                    </form>
+                </DialogContent>
+            </Dialog>
+
+            <AlertDialog
+                open={cancelDialogOpen}
+                onOpenChange={(open) => {
+                    if (!open) closeCancelDialog();
+                }}
+            >
+                <AlertDialogContent className="max-w-md rounded-3xl border border-primary/25 bg-white/95">
+                    <AlertDialogHeader className="space-y-1">
+                        <AlertDialogTitle className="text-lg font-semibold text-primary">Cancel appointment?</AlertDialogTitle>
+                        <AlertDialogDescription>
+                            {cancelTarget
+                                ? `You are cancelling your appointment with ${cancelTarget.doctor} on ${cancelTarget.date} at ${cancelTarget.time}. This action cannot be undone.`
+                                : "This action cannot be undone."}
+                        </AlertDialogDescription>
+                    </AlertDialogHeader>
+                    <AlertDialogFooter className="gap-2">
+                        <AlertDialogCancel className="rounded-xl border-primary/30" disabled={cancelSubmitting}>
+                            Keep appointment
+                        </AlertDialogCancel>
+                        <AlertDialogAction
+                            onClick={handleCancelConfirm}
+                            disabled={cancelSubmitting}
+                            className="rounded-xl bg-red-600 text-sm font-semibold hover:bg-red-700"
+                        >
+                            {cancelSubmitting ? (
+                                <>
+                                    <Loader2 className="mr-2 h-4 w-4 animate-spin" /> Cancelling...
+                                </>
+                            ) : (
+                                "Cancel appointment"
+                            )}
+                        </AlertDialogAction>
+                    </AlertDialogFooter>
+                </AlertDialogContent>
+            </AlertDialog>
+        </PatientLayout>
+    );
+}

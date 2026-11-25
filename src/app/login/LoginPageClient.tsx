@@ -1,0 +1,655 @@
+"use client";
+
+import Image from "next/image";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { signIn } from "next-auth/react";
+import { toast } from "sonner";
+import { Eye, EyeOff, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+    Dialog,
+    DialogContent,
+    DialogHeader,
+    DialogTitle,
+    DialogFooter,
+    DialogDescription,
+} from "@/components/ui/dialog";
+import { normalizeResetContact } from "@/lib/password-reset";
+import { Progress } from "@/components/ui/progress";
+import { getPasswordStrength } from "@/lib/password-strength";
+import { handleRateLimitError } from "@/lib/rate-limit-toast";
+
+export default function LoginPageClient() {
+    const [loadingRole, setLoadingRole] = useState<string | null>(null);
+    const [showPassword, setShowPassword] = useState(false);
+    const [showResetPassword, setShowResetPassword] = useState(false);
+    const [showResetConfirmPassword, setShowResetConfirmPassword] = useState(false);
+    const [forgotOpen, setForgotOpen] = useState(false);
+    const [verifying, setVerifying] = useState(false);
+    const [resetting, setResetting] = useState(false);
+    const [tokenSent, setTokenSent] = useState(false);
+    const [contact, setContact] = useState("");
+    const [newPassword, setNewPassword] = useState("");
+    const [confirmPassword, setConfirmPassword] = useState("");
+    const [code, setCode] = useState("");
+    const [contactError, setContactError] = useState<string | null>(null);
+    const [codeError, setCodeError] = useState<string | null>(null);
+    const [passwordError, setPasswordError] = useState<string | null>(null);
+    const [resendCooldown, setResendCooldown] = useState(0);
+    const router = useRouter();
+
+    useEffect(() => {
+        if (resendCooldown <= 0) return;
+
+        const timeout = window.setTimeout(() => {
+            setResendCooldown((prev) => Math.max(prev - 1, 0));
+        }, 1000);
+
+        return () => window.clearTimeout(timeout);
+    }, [resendCooldown]);
+
+    const maskedContact = useMemo(() => maskContact(contact), [contact]);
+    const passwordStrength = useMemo(
+        () => getPasswordStrength(newPassword),
+        [newPassword]
+    );
+    const passwordMismatchMessage = useMemo(() => {
+        if (!newPassword || !confirmPassword) return null;
+        if (newPassword === confirmPassword) return null;
+        return "Passwords do not match.";
+    }, [confirmPassword, newPassword]);
+    const canReset = useMemo(() => {
+        const trimmedCode = code.trim();
+        if (!/^\d{6}$/.test(trimmedCode)) return false;
+        if (!newPassword || !confirmPassword) return false;
+        if (newPassword !== confirmPassword) return false;
+        return passwordStrength.label !== "Too weak";
+    }, [code, confirmPassword, newPassword, passwordStrength.label]);
+
+    const handleForgotToggle = (open: boolean) => {
+        setForgotOpen(open);
+        if (!open) {
+            setTokenSent(false);
+            setContact("");
+            setNewPassword("");
+            setConfirmPassword("");
+            setCode("");
+            setContactError(null);
+            setCodeError(null);
+            setPasswordError(null);
+            setResendCooldown(0);
+            setVerifying(false);
+            setResetting(false);
+            setShowResetPassword(false);
+            setShowResetConfirmPassword(false);
+        }
+    };
+
+    // ---------- LOGIN ----------
+    async function handleLogin(e: React.FormEvent<HTMLFormElement>, role: string) {
+        e.preventDefault();
+        const formData = new FormData(e.currentTarget);
+
+        const payload: Record<string, string> = {
+            role: role.toUpperCase(),
+            password: String(formData.get("password") ?? ""),
+        };
+
+        if (role === "doctor" || role === "nurse") payload.id = String(formData.get("employee_id") ?? "");
+        else if (role === "patient") payload.id = String(formData.get("patient_id") ?? "");
+        else if (role === "scholar") payload.id = String(formData.get("scholar_id") ?? "");
+
+        try {
+            setLoadingRole(role);
+
+            const result = await signIn("credentials", { redirect: false, ...payload });
+
+            if (result?.error) {
+                const message = result.error.includes("inactive")
+                    ? "Your account is inactive. Please contact the administrator."
+                    : result.error;
+
+                toast.error(message, { position: "top-center" });
+                return;
+            }
+
+            toast.success("Successful login!", { position: "top-center" });
+
+            // Redirect by role
+            switch (payload.role) {
+                case "NURSE":
+                    router.push("/nurse");
+                    break;
+                case "DOCTOR":
+                    router.push("/doctor");
+                    break;
+                case "PATIENT":
+                    router.push("/patient");
+                    break;
+                case "SCHOLAR":
+                    router.push("/scholar");
+                    break;
+                default:
+                    router.push("/login");
+            }
+        } catch (error) {
+            const message =
+                error instanceof Error ? error.message : "Unexpected error occurred.";
+            toast.error(message, { position: "top-center" });
+        } finally {
+            setLoadingRole(null);
+        }
+    }
+
+    // ---------- FORGOT PASSWORD ----------
+    async function requestResetCode(currentContact: string) {
+        const trimmed = currentContact.trim();
+        const normalized = normalizeResetContact(trimmed);
+        if (!normalized) {
+            setContactError("Enter a valid email address.");
+            return false;
+        }
+
+        setContactError(null);
+        setContact(trimmed);
+        setVerifying(true);
+        try {
+            const res = await fetch("/api/auth/request-reset", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contact: trimmed }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                toast.success("Verification code sent via email!");
+                setTokenSent(true);
+                setResendCooldown(60);
+                return true;
+            }
+            if (handleRateLimitError(res, data, "Too many reset attempts. Please wait before trying again.")) {
+                return false;
+            }
+            toast.error(data.error || "Account not found");
+            return false;
+        } catch {
+            toast.error("Network error. Try again.");
+            return false;
+        } finally {
+            setVerifying(false);
+        }
+    }
+
+    async function handleSendCode(e: React.FormEvent) {
+        e.preventDefault();
+        await requestResetCode(contact);
+    }
+
+    async function handleResendCode() {
+        if (verifying || resendCooldown > 0) return;
+        await requestResetCode(contact);
+    }
+
+    async function handleReset(e: React.FormEvent) {
+        e.preventDefault();
+        const trimmedCode = code.trim();
+        const passwordValue = newPassword.trim();
+
+        if (!/^\d{6}$/.test(trimmedCode)) {
+            setCodeError("Enter the 6-digit code we sent.");
+            return;
+        }
+
+        const strength = getPasswordStrength(passwordValue);
+        if (strength.label === "Too weak") {
+            setPasswordError("Create a stronger password before continuing.");
+            return;
+        }
+
+        if (passwordValue !== confirmPassword) {
+            setPasswordError(null);
+            return;
+        }
+
+        setCodeError(null);
+        setPasswordError(null);
+        setResetting(true);
+        try {
+            const res = await fetch("/api/auth/reset-password", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    contact: contact.trim(),
+                    code: trimmedCode, // include the verification code
+                    newPassword: passwordValue,
+                }),
+            });
+            const data = await res.json();
+            if (res.ok) {
+                toast.success("Password reset successful!");
+                handleForgotToggle(false);
+            } else {
+                if (handleRateLimitError(res, data, "Too many password reset attempts. Please wait and try again.")) {
+                    return;
+                }
+                if (typeof data.error === "string") {
+                    const lower = data.error.toLowerCase();
+                    if (lower.includes("code")) setCodeError(data.error);
+                    if (lower.includes("password")) setPasswordError(data.error);
+                }
+                toast.error(data.error || "Reset failed");
+            }
+        } catch {
+            toast.error("Network error. Try again.");
+        } finally {
+            setResetting(false);
+        }
+    }
+
+    // ---------- FORM RENDER ----------
+    const renderForm = (role: string, label: string, fieldName: string, placeholder: string) => (
+        <form className="space-y-5" onSubmit={(e) => handleLogin(e, role)} autoComplete="on">
+            <Input
+                name={fieldName}
+                placeholder={placeholder}
+                required
+                disabled={!!loadingRole}
+                className="h-11 rounded-xl border-primary/20 bg-white/90 text-foreground placeholder:text-slate-400 focus-visible:ring-primary/50"
+                autoComplete="username"
+            />
+
+            <div className="relative">
+                <Input
+                    name="password"
+                    type={showPassword ? "text" : "password"}
+                    placeholder="Password"
+                    required
+                    className="h-11 rounded-xl border-primary/20 bg-white/90 pr-12 text-foreground placeholder:text-slate-400 focus-visible:ring-primary/50"
+                    disabled={!!loadingRole}
+                    autoComplete="current-password"
+                />
+                <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => setShowPassword(!showPassword)}
+                    disabled={!!loadingRole}
+                    className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-500 hover:bg-transparent"
+                >
+                    {showPassword ? (
+                        <EyeOff className="h-5 w-5" />
+                    ) : (
+                        <Eye className="h-5 w-5" />
+                    )}
+                </Button>
+            </div>
+
+            <Button
+                type="submit"
+                disabled={loadingRole === role}
+                className="flex h-11 w-full items-center justify-center gap-2 rounded-xl bg-primary font-medium text-primary-foreground shadow-md shadow-primary/20 transition hover:bg-primary/90"
+            >
+                {loadingRole === role ? (
+                    <>
+                        <Loader2 className="h-4 w-4 animate-spin" /> Logging in...
+                    </>
+                ) : (
+                    `Login as ${label}`
+                )}
+            </Button>
+
+            {/* Forgot password opens modal */}
+            <p className="mt-3 text-center text-sm">
+                <button
+                    type="button"
+                    onClick={() => setForgotOpen(true)}
+                    className="font-medium text-primary underline-offset-4 transition hover:underline"
+                >
+                    Forgot password?
+                </button>
+            </p>
+        </form>
+    );
+
+    // ---------- RENDER ----------
+    return (
+        <div className="relative min-h-screen bg-linear-to-br from-primary/10 via-white to-primary/5">
+            <div className="absolute inset-0 overflow-hidden">
+                <div className="absolute -right-24 -top-24 h-64 w-64 rounded-full bg-primary/20 blur-3xl" />
+                <div className="absolute -bottom-28 -left-16 h-72 w-72 rounded-full bg-primary/20 blur-3xl" />
+            </div>
+
+            <div className="relative mx-auto flex min-h-screen max-w-6xl flex-col justify-between gap-10 px-4 py-10 sm:px-6 sm:py-12 lg:flex-row lg:items-center lg:gap-12 lg:py-24">
+                <div className="mx-auto max-w-2xl text-center sm:text-left lg:mx-0 lg:max-w-lg">
+                    <span className="inline-flex items-center gap-2 rounded-full bg-white/70 px-4 py-1 text-sm font-medium text-primary shadow-sm">
+                        <span className="h-2 w-2 rounded-full bg-primary" />
+                        Secure Access Portal
+                    </span>
+                    <h1 className="mt-6 text-2xl font-bold text-primary sm:text-4xl md:text-5xl">
+                        Welcome back to HNU Clinic Health Record &amp; Appointment System
+                    </h1>
+                    <p className="mt-4 text-base leading-relaxed text-slate-600 sm:text-lg">
+                        Sign in to manage appointments, review health records, and stay connected with the Holy
+                        Name University Clinic team.
+                    </p>
+
+                    <dl className="mt-8 grid gap-4 text-left sm:grid-cols-2">
+                        <div className="rounded-xl bg-white/80 p-4 shadow-sm backdrop-blur">
+                            <dt className="text-sm font-medium text-primary">Multi-role support</dt>
+                            <dd className="mt-1 text-sm text-slate-600">
+                                Access tailored dashboards for doctors, nurses, working scholars, and patients.
+                            </dd>
+                        </div>
+                        <div className="rounded-xl bg-white/80 p-4 shadow-sm backdrop-blur">
+                            <dt className="text-sm font-medium text-primary">Privacy first</dt>
+                            <dd className="mt-1 text-sm text-slate-600">
+                                Your information is protected with secure authentication measures.
+                            </dd>
+                        </div>
+                    </dl>
+                </div>
+
+                <div className="mx-auto w-full max-w-md lg:mx-0">
+                    <Card
+                        className={`relative z-10 overflow-hidden border-0 bg-white/90 shadow-xl backdrop-blur-xl transition-opacity ${loadingRole ? "opacity-60" : ""}`}
+                    >
+                        <div className="absolute inset-x-0 top-0 h-1 bg-linear-to-r from-primary via-emerald-400 to-primary" />
+                        <CardContent className="p-8">
+                            <div className="mb-6 flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-xl font-semibold text-primary">Sign in</h2>
+                                    <p className="text-sm text-slate-500">
+                                        Use your assigned credentials to access the clinic portal.
+                                    </p>
+                                </div>
+                                <div className="hidden sm:block">
+                                    <Image src="/clinic-illustration.svg" alt="HNU Clinic" width={48} height={48} />
+                                </div>
+                            </div>
+
+                            <Tabs defaultValue="doctor" className="w-full">
+                                <TabsList className="grid w-full grid-cols-4 gap-2 rounded-xl bg-primary/10 p-1 text-sm">
+                                    <TabsTrigger
+                                        className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-primary"
+                                        value="doctor"
+                                    >
+                                        Doctor
+                                    </TabsTrigger>
+                                    <TabsTrigger
+                                        className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-primary"
+                                        value="nurse"
+                                    >
+                                        Nurse
+                                    </TabsTrigger>
+                                    <TabsTrigger
+                                        className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-primary"
+                                        value="scholar"
+                                    >
+                                        Scholar
+                                    </TabsTrigger>
+                                    <TabsTrigger
+                                        className="rounded-lg data-[state=active]:bg-white data-[state=active]:text-primary"
+                                        value="patient"
+                                    >
+                                        Patient
+                                    </TabsTrigger>
+                                </TabsList>
+
+                                <TabsContent value="doctor" className="mt-6">
+                                    {renderForm("doctor", "Doctor", "employee_id", "Employee ID")}
+                                </TabsContent>
+                                <TabsContent value="nurse" className="mt-6">
+                                    {renderForm("nurse", "Nurse", "employee_id", "Employee ID")}
+                                </TabsContent>
+                                <TabsContent value="scholar" className="mt-6">
+                                    {renderForm("scholar", "Scholar", "scholar_id", "Student ID")}
+                                </TabsContent>
+                                <TabsContent value="patient" className="mt-6">
+                                    {renderForm("patient", "Patient", "patient_id", "Student ID or Employee ID")}
+                                </TabsContent>
+                            </Tabs>
+                        </CardContent>
+                    </Card>
+
+                    <p className="mt-6 text-center text-xs text-slate-500">
+                        By logging in you agree to our confidentiality and privacy standards.
+                    </p>
+                </div>
+            </div>
+
+            <p className="relative pb-8 text-center text-xs text-slate-500">
+                © {new Date().getFullYear()} HNU Clinic Capstone Project
+            </p>
+
+            {/* Forgot Password Modal */}
+            <Dialog open={forgotOpen} onOpenChange={handleForgotToggle}>
+                <DialogContent className="max-w-sm">
+                    <DialogHeader>
+                        <DialogTitle className="text-primary">Reset Password</DialogTitle>
+                        <DialogDescription className="text-gray-600">
+                            {tokenSent
+                                ? "Enter the 6 digit code sent to your email and set your new password."
+                                : "Enter your registered email address to receive a reset code."}
+                        </DialogDescription>
+                    </DialogHeader>
+
+                    {!tokenSent ? (
+                        <form onSubmit={handleSendCode} className="mt-2 space-y-4">
+                            <div className="space-y-2">
+                                <Input
+                                    value={contact}
+                                    onChange={(e) => {
+                                        setContact(e.target.value);
+                                        if (contactError) setContactError(null);
+                                    }}
+                                    placeholder="Enter email address"
+                                    disabled={verifying}
+                                    required
+                                    autoComplete="email"
+                                />
+                                {contactError && (
+                                    <p className="text-sm text-red-600">{contactError}</p>
+                                )}
+                                <p className="text-xs text-slate-500">
+                                    We&apos;ll send a 6-digit code to your email address.
+                                </p>
+                            </div>
+                            <DialogFooter className="flex-col gap-2 sm:flex-row">
+                                <Button
+                                    type="submit"
+                                    disabled={verifying}
+                                    className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
+                                >
+                                    {verifying ? (
+                                        <>
+                                            <Loader2 className="h-4 w-4 animate-spin" /> Sending...
+                                        </>
+                                    ) : (
+                                        "Send Reset Code"
+                                    )}
+                                </Button>
+                            </DialogFooter>
+                        </form>
+                    ) : (
+                        <>
+                            <div className="space-y-2 rounded-lg border border-dashed border-primary/30 bg-primary/5 px-3 py-2 text-xs text-slate-600">
+                                <span className="font-medium text-primary">Code sent to {maskedContact}</span>
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={() => {
+                                            setTokenSent(false);
+                                            setCode("");
+                                            setNewPassword("");
+                                            setConfirmPassword("");
+                                            setCodeError(null);
+                                            setPasswordError(null);
+                                            setResendCooldown(0);
+                                            setShowResetPassword(false);
+                                            setShowResetConfirmPassword(false);
+                                        }}
+                                        className="text-xs font-medium text-primary underline-offset-2 hover:underline"
+                                    >
+                                        Use a different contact
+                                    </button>
+                                </div>
+                            </div>
+                            <form onSubmit={handleReset} className="mt-4 space-y-4">
+                                <div className="space-y-3">
+                                    <div className="flex flex-col gap-2 sm:flex-row">
+                                        <Button
+                                            type="button"
+                                            variant="outline"
+                                            onClick={handleResendCode}
+                                            disabled={verifying || resendCooldown > 0}
+                                            className="flex-1"
+                                        >
+                                            {verifying ? (
+                                                <>
+                                                    <Loader2 className="h-4 w-4 animate-spin" /> Sending...
+                                                </>
+                                            ) : resendCooldown > 0 ? (
+                                                `Resend in ${resendCooldown}s`
+                                            ) : (
+                                                "Resend code"
+                                            )}
+                                        </Button>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <Input
+                                            placeholder="Enter 6-digit code"
+                                            value={code}
+                                            inputMode="numeric"
+                                            maxLength={6}
+                                            onChange={(e) => {
+                                                setCode(e.target.value);
+                                                if (codeError) setCodeError(null);
+                                            }}
+                                            required
+                                            autoComplete="one-time-code"
+                                        />
+                                        {codeError && <p className="text-sm text-red-600">{codeError}</p>}
+                                    </div>
+                                    <div className="space-y-2">
+                                        <div className="relative">
+                                            <Input
+                                                type={showResetPassword ? "text" : "password"}
+                                                placeholder="New Password"
+                                                value={newPassword}
+                                                minLength={8}
+                                                onChange={(e) => {
+                                                    setNewPassword(e.target.value);
+                                                    if (passwordError) setPasswordError(null);
+                                                }}
+                                                className="pr-12"
+                                                required
+                                                autoComplete="new-password"
+                                            />
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="icon"
+                                                onClick={() => setShowResetPassword((prev) => !prev)}
+                                                className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-500 hover:bg-transparent"
+                                            >
+                                                {showResetPassword ? (
+                                                    <EyeOff className="h-5 w-5" />
+                                                ) : (
+                                                    <Eye className="h-5 w-5" />
+                                                )}
+                                            </Button>
+                                        </div>
+                                        {passwordStrength.label && (
+                                            <div className="space-y-1">
+                                                <Progress
+                                                    value={passwordStrength.value}
+                                                    className="h-2 bg-slate-200"
+                                                    indicatorClassName={passwordStrength.indicatorClass}
+                                                    aria-label="Password strength"
+                                                />
+                                                <p
+                                                    className={`text-xs font-medium ${passwordStrength.textClass}`}
+                                                >
+                                                    {passwordStrength.label} password
+                                                </p>
+                                            </div>
+                                        )}
+                                        <div className="relative">
+                                            <Input
+                                                type={showResetConfirmPassword ? "text" : "password"}
+                                                placeholder="Confirm New Password"
+                                                value={confirmPassword}
+                                                minLength={8}
+                                                onChange={(e) => {
+                                                    setConfirmPassword(e.target.value);
+                                                    if (passwordError) setPasswordError(null);
+                                                }}
+                                                className="pr-12"
+                                                required
+                                                autoComplete="new-password"
+                                            />
+                                            <Button
+                                                type="button"
+                                                variant="ghost"
+                                                size="icon"
+                                                onClick={() =>
+                                                    setShowResetConfirmPassword((prev) => !prev)
+                                                }
+                                                className="absolute right-1.5 top-1/2 -translate-y-1/2 text-slate-500 hover:bg-transparent"
+                                            >
+                                                {showResetConfirmPassword ? (
+                                                    <EyeOff className="h-5 w-5" />
+                                                ) : (
+                                                    <Eye className="h-5 w-5" />
+                                                )}
+                                            </Button>
+                                        </div>
+                                        {passwordError && (
+                                            <p className="text-xs text-muted-foreground">{passwordError}</p>
+                                        )}
+                                        {passwordMismatchMessage && (
+                                            <p className="text-xs text-muted-foreground">{passwordMismatchMessage}</p>
+                                        )}
+                                    </div>
+                                </div>
+                                <DialogFooter>
+                                    <Button
+                                        type="submit"
+                                        disabled={resetting || !canReset}
+                                        className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
+                                    >
+                                        {resetting ? (
+                                            <>
+                                                <Loader2 className="h-4 w-4 animate-spin" /> Updating...
+                                            </>
+                                        ) : (
+                                            "Update Password"
+                                        )}
+                                    </Button>
+                                </DialogFooter>
+                            </form>
+                        </>
+                    )}
+                </DialogContent>
+            </Dialog>
+        </div>
+    );
+}
+
+function maskContact(value: string) {
+    const trimmed = value.trim();
+    if (!trimmed) return "";
+    if (trimmed.includes("@")) {
+        const [local, domain] = trimmed.split("@");
+        if (!domain) return trimmed;
+        const visible = local.slice(0, 2);
+        return `${visible}***@${domain}`;
+    }
+    if (trimmed.length >= 4) {
+        return `***${trimmed.slice(-4)}`;
+    }
+    return trimmed;
+}

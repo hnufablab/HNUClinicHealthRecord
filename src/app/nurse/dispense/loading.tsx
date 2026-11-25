@@ -1,0 +1,58 @@
+import { NurseLayout } from "@/components/nurse/nurse-layout";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+
+export default function NurseDispenseLoading() {
+    return (
+        <NurseLayout
+            title="Dispense Records"
+            description="Monitor dispensed medicines and review batch usage for accurate stock tracking."
+        >
+            <section className="mx-auto w-full max-w-5xl space-y-8">
+                <div className="grid gap-4 md:grid-cols-4">
+                    {Array.from({ length: 4 }).map((_, index) => (
+                        <Card
+                            key={index}
+                            className="rounded-3xl border-primary/20 bg-white/90 shadow-sm"
+                        >
+                            <CardHeader className="space-y-2">
+                                <Skeleton className="h-4 w-1/2" />
+                                <Skeleton className="h-4 w-1/2" />
+                            </CardHeader>
+                            <CardContent>
+                                <Skeleton className="h-4 w-1/2" />
+                                <Skeleton className="h-4 w-1/2" />
+                            </CardContent>
+                        </Card>
+                    ))}
+                </div>
+                <Card className="flex flex-col rounded-3xl border border-primary/20 bg-white/80 shadow-sm">
+                    <CardHeader className="border-b border-primary/20">
+                        <Skeleton className="h-6 w-48" />
+                    </CardHeader>
+                    <CardContent className="flex flex-1 flex-col pt-4">
+                        <div className="overflow-x-auto">
+                            <div className="min-w-full space-y-3">
+                                <div className="grid grid-cols-8 gap-3 rounded-2xl bg-primary/10/60 p-3 text-sm font-medium text-primary">
+                                    {Array.from({ length: 8 }).map((_, index) => (
+                                        <Skeleton key={index} className="h-4 w-full" />
+                                    ))}
+                                </div>
+                                {Array.from({ length: 6 }).map((_, rowIndex) => (
+                                    <div
+                                        key={rowIndex}
+                                        className="grid grid-cols-8 gap-3 rounded-2xl border border-primary/15 bg-white/80 p-3 text-sm"
+                                    >
+                                        {Array.from({ length: 8 }).map((_, colIndex) => (
+                                            <Skeleton key={colIndex} className="h-4 w-full" />
+                                        ))}
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+                    </CardContent>
+                </Card>
+            </section>
+        </NurseLayout>
+    );
+}

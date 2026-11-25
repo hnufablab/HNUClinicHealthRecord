@@ -1,0 +1,339 @@
+import { NextResponse } from "next/server";
+import prisma from "@/lib/prisma";
+import { getServerSession } from "next-auth";
+import { authOptions } from "@/lib/auth";
+import { Role, Gender, Prisma, BloodType } from "@prisma/client";
+import { isAllowedNameSuffix } from "@/lib/validation";
+import { issueEmailVerification, clearEmailVerifications } from "@/lib/email-verification";
+import { consumeRateLimit } from "@/lib/rate-limit";
+
+// Blood type mapping (text ⇄ enum)
+const bloodTypeMap: Record<string, BloodType> = {
+    "A+": BloodType.A_POS,
+    "A-": BloodType.A_NEG,
+    "B+": BloodType.B_POS,
+    "B-": BloodType.B_NEG,
+    "AB+": BloodType.AB_POS,
+    "AB-": BloodType.AB_NEG,
+    "O+": BloodType.O_POS,
+    "O-": BloodType.O_NEG,
+};
+
+const bloodTypeEnumMap: Record<string, string> = {
+    A_POS: "A+",
+    A_NEG: "A-",
+    B_POS: "B+",
+    B_NEG: "B-",
+    AB_POS: "AB+",
+    AB_NEG: "AB-",
+    O_POS: "O+",
+    O_NEG: "O-",
+};
+
+// ---------------- HELPERS ----------------
+function isGender(val: unknown): val is Gender {
+    return val === "Male" || val === "Female";
+}
+
+function toDate(val: unknown): Date | undefined {
+    if (val instanceof Date && !isNaN(val.getTime())) return val;
+    if (typeof val === "string") {
+        const d = new Date(val);
+        if (!isNaN(d.getTime())) return d;
+    }
+    return undefined;
+}
+
+function normalizeStringOrNull(value: unknown): string | null | undefined {
+    if (typeof value === "string") {
+        const trimmed = value.trim();
+        return trimmed.length ? trimmed : null;
+    }
+    if (value === null) return null;
+    return undefined;
+}
+
+function buildEmployeeUpdateInput(raw: Record<string, unknown>): Prisma.EmployeeUpdateInput {
+    const data: Prisma.EmployeeUpdateInput = {};
+
+    if (typeof raw.fname === "string") data.fname = raw.fname;
+    if (typeof raw.mname === "string") data.mname = raw.mname;
+    if (typeof raw.lname === "string") data.lname = raw.lname;
+
+    const suffix = normalizeStringOrNull(raw.suffix);
+    if (suffix !== undefined) data.suffix = suffix;
+
+    const dob = toDate(raw.date_of_birth);
+    if (dob) data.date_of_birth = dob;
+
+    if (isGender(raw.gender)) data.gender = raw.gender;
+
+    if (typeof raw.contactno === "string") data.contactno = raw.contactno;
+    if (typeof raw.address === "string") data.address = raw.address;
+    if (typeof raw.allergies === "string") data.allergies = raw.allergies;
+    const medicalCond = normalizeStringOrNull(raw.medical_cond);
+    if (medicalCond !== undefined) data.medical_cond = medicalCond;
+    if (typeof raw.emergencyco_name === "string") data.emergencyco_name = raw.emergencyco_name;
+    if (typeof raw.emergencyco_num === "string") data.emergencyco_num = raw.emergencyco_num;
+    if (typeof raw.emergencyco_relation === "string") data.emergencyco_relation = raw.emergencyco_relation;
+
+    // Always update email if provided
+    if (typeof raw.email === "string") data.email = raw.email.trim();
+
+    // Convert "A+" → enum
+    if (typeof raw.bloodtype === "string") {
+        const mapped =
+            bloodTypeMap[raw.bloodtype] ||
+            (Object.values(BloodType).includes(raw.bloodtype as BloodType)
+                ? (raw.bloodtype as BloodType)
+                : undefined);
+        if (mapped) data.bloodtype = mapped;
+    }
+
+    return data;
+}
+
+// ---------------- GET OWN PROFILE ----------------
+export async function GET() {
+    try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.id)
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+        const user = await prisma.users.findUnique({
+            where: { user_id: session.user.id },
+            include: { employee: true },
+        });
+
+        if (!user)
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
+
+        if (user.role !== Role.NURSE)
+            return NextResponse.json({ error: "Not a nurse" }, { status: 403 });
+
+        const profile = user.employee
+            ? {
+                ...user.employee,
+                suffix:
+                    typeof user.employee.suffix === "string" && user.employee.suffix.trim()
+                        ? user.employee.suffix.trim()
+                        : null,
+                email: user.employee.email || "",
+                bloodtype:
+                    user.employee.bloodtype && typeof user.employee.bloodtype === "string"
+                        ? bloodTypeEnumMap[user.employee.bloodtype] || user.employee.bloodtype
+                        : null,
+            }
+            : null;
+
+        return NextResponse.json({
+            accountId: user.user_id,
+            username: user.username,
+            role: user.role,
+            status: user.status,
+            profile,
+        });
+    } catch (err) {
+        console.error("[GET /api/nurse/accounts/me]", err);
+        return NextResponse.json(
+            { error: "Failed to fetch profile" },
+            { status: 500 }
+        );
+    }
+}
+
+// ---------------- UPDATE OWN PROFILE ----------------
+// ---------------- UPDATE OWN PROFILE ----------------
+export async function PUT(req: Request) {
+    try {
+        const session = await getServerSession(authOptions);
+        if (!session?.user?.id)
+            return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+        const payload = await req.json();
+        const profile = (payload?.profile ?? {}) as Record<string, unknown>;
+
+        if (profile.suffix !== undefined) {
+            const normalizedSuffix =
+                typeof profile.suffix === "string" ? profile.suffix.trim() : profile.suffix;
+
+            if (!isAllowedNameSuffix(normalizedSuffix as string | null | undefined)) {
+                return NextResponse.json(
+                    { error: "Suffix must be Jr., Sr., II, III, IV, or left blank." },
+                    { status: 400 }
+                );
+            }
+
+            profile.suffix = typeof normalizedSuffix === "string" ? normalizedSuffix || null : normalizedSuffix;
+        }
+
+        const user = await prisma.users.findUnique({
+            where: { user_id: session.user.id },
+            include: { employee: true },
+        });
+
+        if (!user)
+            return NextResponse.json({ error: "User not found" }, { status: 404 });
+
+        if (user.role !== Role.NURSE || !user.employee)
+            return NextResponse.json({ error: "Not a nurse" }, { status: 403 });
+
+        // Build update data
+        const data = buildEmployeeUpdateInput(profile);
+
+        // Prevent modifying DOB if already set
+        if (user.employee.date_of_birth && data.date_of_birth) {
+            delete data.date_of_birth;
+        }
+
+        // Prevent modifying gender if already set
+        if (user.employee.gender && data.gender) {
+            delete data.gender;
+        }
+
+        const current = user.employee;
+
+        let verificationEmail: string | null = null;
+        let shouldClearVerification = false;
+        let normalizedContact: string | null = null;
+        if (typeof profile.email === "string") {
+            const trimmedEmail = profile.email.trim();
+            const existingEmail = current.email ?? "";
+
+            if (!trimmedEmail) {
+                if (existingEmail) {
+                    data.email = null;
+                    shouldClearVerification = true;
+                } else {
+                    delete data.email;
+                }
+            } else if (trimmedEmail.toLowerCase() !== existingEmail.toLowerCase()) {
+                const rate = await consumeRateLimit(
+                    `email-verify:${session.user.id}`,
+                    3,
+                    60 * 60_000
+                );
+                if (!rate.success) {
+                    const minutes = rate.retryAfterMs
+                        ? Math.ceil(rate.retryAfterMs / 60000)
+                        : null;
+                    const waitMessage =
+                        minutes && minutes > 0
+                            ? `Please wait ${minutes} minute${minutes === 1 ? "" : "s"} before requesting another verification email.`
+                            : "Please wait before requesting another verification email.";
+                    return NextResponse.json(
+                        { error: `Too many verification requests. ${waitMessage}` },
+                        { status: 429 }
+                    );
+                }
+
+                data.email = trimmedEmail;
+                verificationEmail = trimmedEmail;
+            } else {
+                delete data.email;
+            }
+        }
+
+        if (typeof data.contactno === "string") {
+            const trimmedContact = data.contactno.trim();
+
+            if (!trimmedContact) {
+                if (current.contactno) {
+                    data.contactno = null;
+                } else {
+                    delete data.contactno;
+                }
+            } else if (trimmedContact === current.contactno) {
+                delete data.contactno;
+            } else {
+                data.contactno = trimmedContact;
+                normalizedContact = trimmedContact;
+            }
+        }
+
+        // No actual changes?
+        if (Object.keys(data).length === 0) {
+            return NextResponse.json({
+                success: true,
+                message: "No changes detected.",
+            });
+        }
+
+        if (normalizedContact) {
+            const duplicateContact = await prisma.employee.findFirst({
+                where: {
+                    contactno: normalizedContact,
+                    NOT: { user_id: session.user.id },
+                },
+            });
+            if (duplicateContact) {
+                return NextResponse.json(
+                    { error: "Contact number already exists." },
+                    { status: 400 }
+                );
+            }
+        }
+
+        const updated = await prisma.employee.update({
+            where: { user_id: session.user.id },
+            data,
+        });
+
+        if (shouldClearVerification) {
+            await clearEmailVerifications(session.user.id);
+        }
+
+        if (verificationEmail) {
+            const displayName =
+                `${updated.fname ?? ""} ${updated.lname ?? ""}`.trim() ||
+                user.username ||
+                "Clinic user";
+            try {
+                await issueEmailVerification({
+                    userId: session.user.id,
+                    email: verificationEmail,
+                    name: displayName,
+                });
+            } catch (error) {
+                console.error("[Nurse email verification]", error);
+                return NextResponse.json(
+                    {
+                        error:
+                            "Profile saved but the verification email could not be sent. Please try again later.",
+                    },
+                    { status: 500 }
+                );
+            }
+        }
+
+        return NextResponse.json({
+            success: true,
+            profile: {
+                ...updated,
+                email: updated.email || "",
+                bloodtype: updated.bloodtype
+                    ? bloodTypeEnumMap[updated.bloodtype] || updated.bloodtype
+                    : null,
+            },
+            verificationEmailSent: Boolean(verificationEmail),
+        });
+    } catch (err: unknown) {
+        console.error("[PUT /api/nurse/accounts/me]", err);
+
+        if (err instanceof Prisma.PrismaClientKnownRequestError) {
+            if (err.code === "P2002") {
+                const field = (err.meta?.target as string[])?.[0] ?? "field";
+                return NextResponse.json(
+                    { error: `Duplicate ${field} — this value is already in use.` },
+                    { status: 400 }
+                );
+            }
+        }
+
+        return NextResponse.json(
+            { error: "Failed to update profile" },
+            { status: 500 }
+        );
+    }
+}
+

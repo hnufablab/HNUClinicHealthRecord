@@ -1,0 +1,281 @@
+"use client";
+
+import dynamic from "next/dynamic";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState, useTransition } from "react";
+import { toast } from "sonner";
+import { AlertCircle, BadgeCheck, RefreshCcw, Search, Users2 } from "lucide-react";
+
+import ScholarLayout from "@/components/scholar/scholar-layout";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+    Select,
+    SelectContent,
+    SelectItem,
+    SelectTrigger,
+    SelectValue,
+} from "@/components/ui/select";
+import { TablePagination } from "@/components/table-pagination";
+
+import ScholarPatientsLoading from "./loading";
+import { PatientsTable } from "./patients-table";
+import { preparePatientRecords, type PreparedPatientRecord } from "./types";
+import { usePagination } from "@/hooks/use-pagination";
+import { AlphabetFilter } from "@/components/patient/alphabet-filter";
+
+const PatientDetailDialog = dynamic(
+    () => import("./patient-detail-dialog").then((mod) => mod.PatientDetailDialog),
+    {
+        loading: () => (
+            <div className="px-6 py-8 text-center text-sm text-muted-foreground">Loading patient details…</div>
+        ),
+        ssr: false,
+    }
+);
+
+export type ScholarPatientsPageClientProps = {
+    initialRecords: PreparedPatientRecord[];
+    initialLoaded: boolean;
+};
+
+export function ScholarPatientsPageClient({ initialRecords, initialLoaded }: ScholarPatientsPageClientProps) {
+    const [records, setRecords] = useState<PreparedPatientRecord[]>(() => [...initialRecords]);
+    const [loading, setLoading] = useState(false);
+    const [initializing, setInitializing] = useState(!initialLoaded);
+    const [search, setSearch] = useState("");
+    const [typeFilter, setTypeFilter] = useState("all");
+    const [statusFilter, setStatusFilter] = useState("active");
+    const [appointmentFilter, setAppointmentFilter] = useState("all");
+    const [letterFilter, setLetterFilter] = useState("All");
+    const [selected, setSelected] = useState<PreparedPatientRecord | null>(null);
+    const [detailOpen, setDetailOpen] = useState(false);
+    const [isRefreshing, startTransition] = useTransition();
+
+    const deferredSearch = useDeferredValue(search.trim().toLowerCase());
+
+    const loadRecords = useCallback(async () => {
+        try {
+            setLoading(true);
+            const query = new URLSearchParams();
+            query.set("type", "all");
+            query.set("status", "all");
+            const res = await fetch(`/api/scholar/patients?${query.toString()}`, { cache: "no-store" });
+            const data = await res.json();
+            if (!res.ok) {
+                toast.error(data?.error ?? "Failed to fetch patient list");
+                return;
+            }
+            startTransition(() => {
+                setRecords(Array.isArray(data) ? preparePatientRecords(data) : []);
+            });
+        } catch (err) {
+            console.error(err);
+            toast.error("Unable to load patients");
+        } finally {
+            setLoading(false);
+            setInitializing(false);
+        }
+    }, [startTransition]);
+
+    useEffect(() => {
+        if (!initialLoaded) {
+            void loadRecords();
+        }
+    }, [initialLoaded, loadRecords]);
+
+    const filteredRecords = useMemo(() => {
+        if (
+            !deferredSearch &&
+            typeFilter === "all" &&
+            statusFilter === "all" &&
+            appointmentFilter === "all"
+        ) {
+            return records;
+        }
+
+        return records.filter((record) => {
+            if (typeFilter !== "all" && record.patientType.toLowerCase() !== typeFilter) {
+                return false;
+            }
+            if (statusFilter !== "all") {
+                if (statusFilter === "active" && record.status.toLowerCase() !== "active") return false;
+                if (statusFilter === "inactive" && record.status.toLowerCase() !== "inactive") return false;
+            }
+            if (appointmentFilter === "with" && !record.latestAppointment) return false;
+            if (appointmentFilter === "without" && record.latestAppointment) return false;
+
+            if (
+                letterFilter !== "All" &&
+                !record.fullName.trim().toUpperCase().startsWith(letterFilter)
+            ) {
+                return false;
+            }
+
+            if (!deferredSearch) return true;
+
+            return record.searchText.includes(deferredSearch);
+        });
+    }, [appointmentFilter, deferredSearch, letterFilter, records, statusFilter, typeFilter]);
+
+    const { pageItems: paginatedRecords, currentPage, pageSize, setPage } = usePagination(filteredRecords, {
+        resetDeps: [appointmentFilter, deferredSearch, letterFilter, statusFilter, typeFilter],
+    });
+
+    const totalPatients = records.length;
+    const withAppointments = useMemo(
+        () => records.filter((record) => Boolean(record.latestAppointment)).length,
+        [records]
+    );
+    const withoutAppointments = totalPatients - withAppointments;
+
+    function openDetails(record: PreparedPatientRecord) {
+        setSelected(record);
+        setDetailOpen(true);
+    }
+
+    function closeDetails() {
+        setDetailOpen(false);
+        setSelected(null);
+    }
+
+    if (initializing) {
+        return <ScholarPatientsLoading />;
+    }
+
+    return (
+        <ScholarLayout
+            title="Patient records"
+            description="Review student and employee profiles, confirm eligibility, and keep contact details ready for the care team."
+            actions={
+                <Button
+                    variant="outline"
+                    onClick={loadRecords}
+                    className="rounded-xl border-primary/30 text-primary hover:bg-primary/10"
+                    disabled={loading || isRefreshing}
+                >
+                    <RefreshCcw className="mr-2 h-4 w-4" />
+                    {loading || isRefreshing ? "Refreshing..." : "Refresh records"}
+                </Button>
+            }
+        >
+            <div className="flex flex-col gap-6">
+                <section className="grid gap-4 md:grid-cols-3 min-w-0">
+                    <Card className="rounded-3xl border-primary/20 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">Total profiles</CardTitle>
+                                <p className="text-sm text-muted-foreground">Student and employee records synced</p>
+                            </div>
+                            <Users2 className="h-9 w-9 text-primary" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{totalPatients}</p>
+                        </CardContent>
+                    </Card>
+                    <Card className="rounded-3xl border-primary/20 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">With appointments</CardTitle>
+                                <p className="text-sm text-muted-foreground">Latest visit attached to the chart</p>
+                            </div>
+                            <BadgeCheck className="h-9 w-9 text-primary" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{withAppointments}</p>
+                        </CardContent>
+                    </Card>
+                    <Card className="rounded-3xl border-primary/20 bg-white/90 shadow-sm">
+                        <CardHeader className="flex flex-row items-center justify-between">
+                            <div>
+                                <CardTitle className="text-base font-semibold text-primary">No appointment yet</CardTitle>
+                                <p className="text-sm text-muted-foreground">Students ready for intake coordination</p>
+                            </div>
+                            <AlertCircle className="h-9 w-9 text-amber-500" />
+                        </CardHeader>
+                        <CardContent>
+                            <p className="text-3xl font-semibold text-primary">{withoutAppointments}</p>
+                        </CardContent>
+                    </Card>
+                </section>
+
+                <Card className="rounded-3xl border-primary/20 bg-white/90 shadow-sm">
+                    <CardHeader className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
+                        <div className="space-y-1">
+                            <CardTitle className="text-xl text-primary">Patient directory</CardTitle>
+                            <p className="text-sm text-muted-foreground">
+                                Filter student and employee details before handing off to nurses or doctors.
+                            </p>
+                        </div>
+                        <div className="space-y-1 w-full lg:flex-1">
+                            <Label className="text-sm font-semibold text-primary">Search Records</Label>
+                            <div className="relative">
+                                <Search className="absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+                                <Input
+                                    placeholder="Search by name, ID, or program"
+                                    value={search}
+                                    onChange={(event) => setSearch(event.target.value)}
+                                    className="h-9 w-full pl-10 pr-4"
+                                />
+                            </div>
+                        </div>
+                        <div className="space-y-1 w-full lg:flex-1 lg:flex lg:items-center lg:justify-end lg:space-x-4 lg:space-y-0">
+                            <Select value={typeFilter} onValueChange={setTypeFilter}>
+                                <SelectTrigger className="h-10 w-full">
+                                    <SelectValue placeholder="All types" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="all">All Types</SelectItem>
+                                    <SelectItem value="student">Students</SelectItem>
+                                    <SelectItem value="employee">Employees</SelectItem>
+                                </SelectContent>
+                            </Select>
+                            <Select value={statusFilter} onValueChange={setStatusFilter}>
+                                <SelectTrigger className="h-10 w-full">
+                                    <SelectValue placeholder="Account Status" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="all">All Status</SelectItem>
+                                    <SelectItem value="active">Active</SelectItem>
+                                    <SelectItem value="inactive">Inactive</SelectItem>
+                                </SelectContent>
+                            </Select>
+                            <Select value={appointmentFilter} onValueChange={setAppointmentFilter}>
+                                <SelectTrigger className="h-10 w-full">
+                                    <SelectValue placeholder="Appointment" />
+                                </SelectTrigger>
+                                <SelectContent>
+                                    <SelectItem value="all">All Appointments</SelectItem>
+                                    <SelectItem value="with">With appointment</SelectItem>
+                                    <SelectItem value="without">No appointment</SelectItem>
+                                </SelectContent>
+                            </Select>
+                        </div>
+                    </CardHeader>
+                    <CardContent className="pt-4 space-y-6">
+                        <AlphabetFilter value={letterFilter} onChange={setLetterFilter} />
+                        <PatientsTable
+                            records={paginatedRecords}
+                            loading={loading}
+                            onSelect={openDetails}
+                        />
+                        <TablePagination
+                            currentPage={currentPage}
+                            totalItems={filteredRecords.length}
+                            pageSize={pageSize}
+                            loading={loading || isRefreshing}
+                            onPageChange={setPage}
+                        />
+                    </CardContent>
+                </Card>
+            </div>
+            {detailOpen && selected ? (
+                <PatientDetailDialog open={detailOpen} record={selected} onClose={closeDetails} />
+            ) : null}
+
+        </ScholarLayout>
+    );
+}
+
+export default ScholarPatientsPageClient;
